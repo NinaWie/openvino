@@ -1,0 +1,16 @@
+task_name: openvino_ocl_int3_gemm
+job_name: benchmark_openvino_ocl_int3_gemm
+
+gpu_arch: ptl
+language: OCL
+
+prompt:
+  reference_language: OCL
+
+test_timeout: 900
+test_reference: true
+has_reference_build_step: true
+
+hyperparameters:
+  buildtime: null
+  runtime: null
