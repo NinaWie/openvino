@@ -67,6 +67,12 @@ struct FullyConnectedImplementationManager : public ImplementationManager {
         if (!f16f16_case && !bf16bf16_case && !f32f32_case && !u8s8_case && !compressed_case && !fp_compressed_case)
             LOG_AND_RETURN_FALSE(node);
 
+        // oneDNN has no optimized kernel for u3 weights and falls back to ocl:ref,
+        // which is orders of magnitude slower than the OCL int3 GEMM. Hand those
+        // over, but only when the OCL manager will actually accept the node.
+        if (wei_dt == data_types::u3 && fc_prim->weights_transposed)
+            LOG_AND_RETURN_FALSE(node);
+
         if (fc_prim->compressed_weights) {
             if (fc_prim->decompression_zero_point.is_valid()) {
                 const auto decompression_zp_idx = fc_prim->bias.is_valid() ? 4 : 3;
