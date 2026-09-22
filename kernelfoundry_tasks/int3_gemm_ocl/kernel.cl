@@ -22,9 +22,39 @@
 // A granule is 32 values of one column, which is exactly the DPAS `b` operand of
 // intel_sub_group_i8_i8_matrix_mad_k32 (one column, K=32, 256 bits, increasing K
 // order). So the unpacked weights feed the matrix engine directly, with no
-// repacking and no shuffle. DPAS is used when a full 8-row tile is available;
-// decode-shaped calls (M < 8) fall back to the scalar integer path, where the
-// matrix engine would waste most of its result tile anyway.
+// repacking and no shuffle.
+//
+// Unpacking a granule costs ~3 integer ops per weight, which dwarfs the single
+// DPAS that consumes it. The loop is therefore blocked so that the unpack is
+// hoisted out of the M dimension: one quantization group's worth of weights
+// (CHUNKS_PER_GROUP granules) is decoded once into registers and then replayed
+// against M_BLOCKS separate 8-row tiles. TILE_M is what buys back the matrix
+// engine; at TILE_M == 8 the kernel spends ~28 integer instructions per DPAS.
+//
+// Register pressure caps TILE_M at 32, so the reuse is extended a second time
+// through SLM. The SG_M subgroups of a workgroup all cover the same n block and
+// therefore want the same decoded weights, so they split the group's granules
+// between them, publish them to SLM and each read back the full set. Effective
+// reuse is TILE_M * SG_M rows per unpack. Once SG_M exceeds the CHUNKS_PER_GROUP
+// granules of a single quantization group, GROUPS_PER_ITER groups are staged at
+// a time so there is still exactly one granule per subgroup to decode; that also
+// divides the barrier count by GROUPS_PER_ITER. The SLM buffer is double-buffered
+// on the parity of the staging iteration, which keeps it to one barrier per stage.
+//
+// Small-M shapes have the opposite problem: with one row tile there are too few
+// workgroups to fill the machine and the unpack has nothing to amortize against.
+// There SG_K subgroups split the K range instead, each accumulating a partial
+// dot product that is reduced through SLM at the end. That trades a little
+// redundant weight traffic for SG_K times the thread count.
+//
+// Activations are fetched one quantization group at a time with a single wide
+// block read per row. intel_sub_group_block_read_us4 hands lane L the ushorts at
+// [L], [L+16], [L+32], [L+48], i.e. the k-pair (2L, 2L+1) of each of the four
+// granules in the group - exactly the DPAS `a` operand, four chunks deep, for one
+// send instead of four.
+//
+// Decode-shaped calls (TILE_M < 8) fall back to the scalar integer path, where
+// the matrix engine would waste most of its result tile.
 
 // [EVOLVE_START]
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
@@ -50,6 +80,12 @@
 #ifndef USE_DPAS
 #define USE_DPAS 0
 #endif
+#ifndef SG_M                            // subgroups per workgroup, stacked along M
+#define SG_M 1
+#endif
+#ifndef SG_K                            // subgroups per workgroup, splitting K
+#define SG_K 1
+#endif
 
 #define SIMD 16
 #define K_CHUNK 32                      // u3 values per 12-byte granule, and the DPAS K step
@@ -59,6 +95,39 @@
 #define CHUNK_UINTS (3 * SIMD)
 #define A_UINTS_PER_ROW (K_SIZE / 4)
 #define A_UINTS_PER_CHUNK (K_CHUNK / 4)
+#define M_BLOCKS (TILE_M / 8)           // DPAS result tiles stacked along M
+
+// Quantization groups staged into SLM per barrier, so that every subgroup has at
+// least one granule to decode.
+#if SG_M > CHUNKS_PER_GROUP
+#define GROUPS_PER_ITER (SG_M / CHUNKS_PER_GROUP)
+#else
+#define GROUPS_PER_ITER 1
+#endif
+#define CHUNKS_PER_ITER (GROUPS_PER_ITER * CHUNKS_PER_GROUP)
+#define CHUNKS_PER_SG (CHUNKS_PER_ITER / SG_M)
+#define ITERS_K (GROUPS_K / GROUPS_PER_ITER)
+
+#define GROUPS_PER_SG (GROUPS_K / SG_K)
+
+#if USE_DPAS
+#define SG_COUNT SG_M
+#else
+#define SG_COUNT SG_K
+#endif
+
+#if USE_DPAS && (CHUNKS_PER_ITER % SG_M) != 0
+#error "SG_M must divide CHUNKS_PER_ITER so the granules split evenly"
+#endif
+#if USE_DPAS && (GROUPS_K % GROUPS_PER_ITER) != 0
+#error "GROUPS_PER_ITER must divide GROUPS_K"
+#endif
+#if (GROUPS_K % SG_K) != 0
+#error "SG_K must divide GROUPS_K"
+#endif
+#if USE_DPAS && SG_K > 1
+#error "SG_K is only supported on the scalar path"
+#endif
 
 // Bit-stream extraction of value i (a literal) from the three granule words.
 // Both branches fold away at compile time; only i == 10 and i == 21 straddle.
@@ -96,6 +165,7 @@ inline int FUNC_mad4(char4 a, char4 b, int acc) {
 }
 
 __attribute__((intel_reqd_sub_group_size(SIMD)))
+__attribute__((reqd_work_group_size(SIMD, SG_COUNT, 1)))
 __kernel void int3_gemm_ocl(const __global char* A,
                             const __global half* a_scale,
                             const __global uint* B,
@@ -103,46 +173,106 @@ __kernel void int3_gemm_ocl(const __global char* A,
                             __global half* C,
                             const int M) {
     const uint lane = get_sub_group_local_id();
+    const uint sg = get_local_id(1);
     const uint nb = get_group_id(0);
     const uint n = nb * SIMD + lane;
-    const uint m0 = (uint)get_global_id(1) * TILE_M;
 
     float out[TILE_M];
 #pragma unroll
     for (uint t = 0; t < TILE_M; ++t)
         out[t] = 0.0f;
 
-    for (uint g = 0; g < GROUPS_K; ++g) {
 #if USE_DPAS
-        // The quantization group spans CHUNKS_PER_GROUP DPAS steps; the int32
-        // accumulator is drained and rescaled at each group boundary.
-        int8 acc = (int8)(0);
+    const uint m0 = ((uint)get_group_id(1) * SG_M + sg) * TILE_M;
+#if SG_M > 1
+    __local int8 wshare[2][CHUNKS_PER_ITER][SIMD];
+#endif
+
+    for (uint it = 0; it < ITERS_K; ++it) {
+        const uint g0 = it * GROUPS_PER_ITER;
+#if SG_M > 1
+        // Stage this iteration's granules: one slice per subgroup, then publish.
+        const uint buf = it & 1u;
 #pragma unroll
-        for (uint cc = 0; cc < CHUNKS_PER_GROUP; ++cc) {
-            const uint chunk = g * CHUNKS_PER_GROUP + cc;
-            const __global uint* wp = B + (nb * CHUNKS_K + chunk) * CHUNK_UINTS;
+        for (uint i = 0; i < CHUNKS_PER_SG; ++i) {
+            const uint cc = sg * CHUNKS_PER_SG + i;
+            const __global uint* wp =
+                B + (nb * CHUNKS_K + g0 * CHUNKS_PER_GROUP + cc) * CHUNK_UINTS;
 
             const uint w0 = intel_sub_group_block_read(wp);
             const uint w1 = intel_sub_group_block_read(wp + SIMD);
             const uint w2 = intel_sub_group_block_read(wp + 2 * SIMD);
-            const int8 b = U3_TO_DPAS_B(w0, w1, w2);
-
-            // Each lane supplies two K-adjacent activations per row, packed low-first.
-            const __global ushort* arow =
-                (const __global ushort*)(A + m0 * K_SIZE + chunk * K_CHUNK);
-            short8 a;
-#pragma unroll
-            for (uint t = 0; t < 8; ++t)
-                a[t] = as_short(intel_sub_group_block_read_us(arow + t * (K_SIZE / 2)));
-
-            acc = intel_sub_group_i8_i8_matrix_mad_k32(a, b, acc);
+            wshare[buf][cc][lane] = U3_TO_DPAS_B(w0, w1, w2);
         }
+        barrier(CLK_LOCAL_MEM_FENCE);
+#endif
 
-        const float bs = convert_float(b_scale[n * GROUPS_K + g]);
 #pragma unroll
-        for (uint t = 0; t < TILE_M; ++t)
-            out[t] += (float)acc[t] * convert_float(a_scale[(m0 + t) * GROUPS_K + g]) * bs;
+        for (uint gi = 0; gi < GROUPS_PER_ITER; ++gi) {
+            const uint g = g0 + gi;
+
+            int8 wb[CHUNKS_PER_GROUP];
+#pragma unroll
+            for (uint cc = 0; cc < CHUNKS_PER_GROUP; ++cc) {
+#if SG_M > 1
+                wb[cc] = wshare[buf][gi * CHUNKS_PER_GROUP + cc][lane];
 #else
+                const __global uint* wp =
+                    B + (nb * CHUNKS_K + g * CHUNKS_PER_GROUP + cc) * CHUNK_UINTS;
+
+                const uint w0 = intel_sub_group_block_read(wp);
+                const uint w1 = intel_sub_group_block_read(wp + SIMD);
+                const uint w2 = intel_sub_group_block_read(wp + 2 * SIMD);
+                wb[cc] = U3_TO_DPAS_B(w0, w1, w2);
+#endif
+            }
+
+            const float bs = convert_float(b_scale[n * GROUPS_K + g]);
+
+#pragma unroll
+            for (uint mb = 0; mb < M_BLOCKS; ++mb) {
+                // Activations for 8 rows x the whole group, one send per row.
+                ushort av[8][CHUNKS_PER_GROUP];
+#pragma unroll
+                for (uint t = 0; t < 8; ++t) {
+                    const __global ushort* ap = (const __global ushort*)(
+                        A + (m0 + mb * 8 + t) * K_SIZE + g * GROUP_SIZE);
+#if CHUNKS_PER_GROUP == 4
+                    const ushort4 q = intel_sub_group_block_read_us4(ap);
+                    av[t][0] = q.s0;
+                    av[t][1] = q.s1;
+                    av[t][2] = q.s2;
+                    av[t][3] = q.s3;
+#else
+#pragma unroll
+                    for (uint cc = 0; cc < CHUNKS_PER_GROUP; ++cc)
+                        av[t][cc] = intel_sub_group_block_read_us(ap + cc * SIMD);
+#endif
+                }
+
+                // The int32 accumulator is drained and rescaled at each group boundary.
+                int8 acc = (int8)(0);
+#pragma unroll
+                for (uint cc = 0; cc < CHUNKS_PER_GROUP; ++cc) {
+                    short8 a;
+#pragma unroll
+                    for (uint t = 0; t < 8; ++t)
+                        a[t] = as_short(av[t][cc]);
+                    acc = intel_sub_group_i8_i8_matrix_mad_k32(a, wb[cc], acc);
+                }
+
+#pragma unroll
+                for (uint t = 0; t < 8; ++t)
+                    out[mb * 8 + t] +=
+                        (float)acc[t] *
+                        convert_float(a_scale[(m0 + mb * 8 + t) * GROUPS_K + g]) * bs;
+            }
+        }
+    }
+#else
+    const uint m0 = (uint)get_group_id(1) * TILE_M;
+
+    for (uint g = sg * GROUPS_PER_SG; g < (sg + 1) * GROUPS_PER_SG; ++g) {
         int acc[TILE_M];
 #pragma unroll
         for (uint t = 0; t < TILE_M; ++t)
@@ -187,8 +317,28 @@ __kernel void int3_gemm_ocl(const __global char* A,
 #pragma unroll
         for (uint t = 0; t < TILE_M; ++t)
             out[t] += (float)acc[t] * convert_float(a_scale[(m0 + t) * GROUPS_K + g]) * bs;
-#endif
     }
+#endif
+
+#if !USE_DPAS && SG_K > 1
+    // Each subgroup owns a slice of K; sum the partial dot products.
+    __local float partial[SG_K][TILE_M][SIMD];
+#pragma unroll
+    for (uint t = 0; t < TILE_M; ++t)
+        partial[sg][t][lane] = out[t];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (sg != 0)
+        return;
+#pragma unroll
+    for (uint t = 0; t < TILE_M; ++t) {
+        float s = partial[0][t][lane];
+#pragma unroll
+        for (uint j = 1; j < SG_K; ++j)
+            s += partial[j][t][lane];
+        out[t] = s;
+    }
+#endif
 
 #pragma unroll
     for (uint t = 0; t < TILE_M; ++t)

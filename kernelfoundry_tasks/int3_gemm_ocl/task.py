@@ -96,11 +96,21 @@ def pack_u3_blocked(weights: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(words)
 
 
-def make_data(m_size: int, n_size: int, k_size: int, tile_m: int, seed: int = 0) -> dict:
+def make_data(
+    m_size: int,
+    n_size: int,
+    k_size: int,
+    tile_m: int,
+    sg_m: int = 1,
+    sg_k: int = 1,
+    seed: int = 0,
+) -> dict:
     """Build one GEMM case: int8 activations, packed u3 weights, per-group scales."""
     rng = np.random.default_rng(seed)
     groups = k_size // GROUP_SIZE
-    m_pad = ((m_size + tile_m - 1) // tile_m) * tile_m
+    # A workgroup covers sg_m stacked m-tiles, so M pads up to the workgroup tile.
+    m_gran = tile_m * sg_m
+    m_pad = ((m_size + m_gran - 1) // m_gran) * m_gran
 
     activations = np.zeros((m_pad, k_size), dtype=np.int8)
     activations[:m_size] = rng.integers(-127, 128, size=(m_size, k_size), dtype=np.int16).astype(np.int8)
@@ -117,6 +127,8 @@ def make_data(m_size: int, n_size: int, k_size: int, tile_m: int, seed: int = 0)
         "N": n_size,
         "K": k_size,
         "tile_m": tile_m,
+        "sg_m": sg_m,
+        "sg_k": sg_k,
         "groups": groups,
         "activations": activations,
         "weights": weights,
@@ -158,7 +170,15 @@ def to_device(queue: cl.CommandQueue, data: dict) -> tuple[tuple[Any, ...], cl.B
     return args, c_buf
 
 
-def build_kernel(use_reference: bool, queue: cl.CommandQueue, n_size: int, k_size: int, tile_m: int):
+def build_kernel(
+    use_reference: bool,
+    queue: cl.CommandQueue,
+    n_size: int,
+    k_size: int,
+    tile_m: int,
+    sg_m: int = 1,
+    sg_k: int = 1,
+):
     """Compile the kernel under test (or the reference) and return a launcher."""
     root = Path(__file__).parent
     source = (root / ("reference.cl" if use_reference else "kernel.cl")).read_text()
@@ -169,18 +189,26 @@ def build_kernel(use_reference: bool, queue: cl.CommandQueue, n_size: int, k_siz
         f"-DGROUP_SIZE={GROUP_SIZE}",
         f"-DWEI_ZP={WEI_ZP}",
         f"-DTILE_M={tile_m}",
-        f"-DUSE_DPAS={1 if tile_m == 8 else 0}",
+        f"-DUSE_DPAS={1 if tile_m >= 8 else 0}",
+        f"-DSG_M={sg_m}",
+        f"-DSG_K={sg_k}",
     ]
     program = cl.Program(queue.context, source).build(options=defines)
     kernel_fn = getattr(program, "int3_gemm_ocl")
+
+    # Subgroups of a workgroup are stacked along M on the DPAS path and along K
+    # on the scalar path; only one of the two factors is ever above 1.
+    sgs = sg_m if tile_m >= 8 else sg_k
 
     def launch(*args):
         m_size = int(args[-1])
         if use_reference:
             # One work item per output element.
             return kernel_fn(queue, (n_size, m_size), None, *args)
-        m_pad = ((m_size + tile_m - 1) // tile_m) * tile_m
-        return kernel_fn(queue, (n_size, m_pad // tile_m), (SIMD, 1), *args)
+        m_gran = tile_m * sg_m
+        m_pad = ((m_size + m_gran - 1) // m_gran) * m_gran
+        # sg_m tiles are already folded into m_pad; sg_k adds a K-split dimension.
+        return kernel_fn(queue, (n_size, (m_pad // tile_m) * sg_k), (SIMD, sgs), *args)
 
     return launch
 
@@ -188,7 +216,15 @@ def build_kernel(use_reference: bool, queue: cl.CommandQueue, n_size: int, k_siz
 @pytest.fixture(scope="function")
 def data_for_test(request):
     case = request.param
-    return make_data(case["M"], case["N"], case["K"], case["tile_m"], seed=case["M"] + case["N"])
+    return make_data(
+        case["M"],
+        case["N"],
+        case["K"],
+        case["tile_m"],
+        case.get("sg_m", 1),
+        case.get("sg_k", 1),
+        seed=case["M"] + case["N"],
+    )
 
 
 class TestInt3GemmOCL(TestBase):
@@ -203,16 +239,25 @@ class TestInt3GemmOCL(TestBase):
                 break
         # The DPAS path only compiles on a GPU; if the build host has none, check
         # the scalar variants and leave DPAS to the test machine.
-        tile_ms = (1, 4, 8) if device is not None else (1, 4)
+        tile_ms = (1, 4, 8, 16, 32, 64) if device is not None else (1, 4)
         if device is None:
             device = cl.get_platforms()[0].get_devices()[0]
         ctx = cl.Context([device])
         queue = cl.CommandQueue(ctx)
         for tile_m in tile_ms:
-            kernel = build_kernel(
-                use_reference=use_reference, queue=queue, n_size=512, k_size=2048, tile_m=tile_m
-            )
-            assert kernel is not None
+            for sg_m, sg_k in (
+                [(s, 1) for s in (1, 2, 4, 8)] if tile_m >= 8 else [(1, s) for s in (1, 2, 4, 8)]
+            ):
+                kernel = build_kernel(
+                    use_reference=use_reference,
+                    queue=queue,
+                    n_size=512,
+                    k_size=2048,
+                    tile_m=tile_m,
+                    sg_m=sg_m,
+                    sg_k=sg_k,
+                )
+                assert kernel is not None
         return []
 
     def build(self, gpu_arch) -> list[str]:  # pylint: disable=unused-argument
@@ -238,6 +283,8 @@ class TestInt3GemmOCL(TestBase):
             n_size=data["N"],
             k_size=data["K"],
             tile_m=data["tile_m"],
+            sg_m=data["sg_m"],
+            sg_k=data["sg_k"],
         )
         kernel(*args)
         ocl_queue.finish()
@@ -274,6 +321,8 @@ class TestInt3GemmOCL(TestBase):
             n_size=data["N"],
             k_size=data["K"],
             tile_m=data["tile_m"],
+            sg_m=data["sg_m"],
+            sg_k=data["sg_k"],
         )
 
         runtimes = measure_runtime(
