@@ -131,6 +131,7 @@ std::string toCLType(WeightsType wType) {
         case WeightsType::INT4:
         case WeightsType::INT8:
             return GetTypeName<int8_t>();
+        case WeightsType::UINT3:
         case WeightsType::UINT4:
         case WeightsType::UINT8:
             return GetTypeName<uint8_t>();
@@ -152,6 +153,7 @@ std::string toCLType(Datatype dType) {
         case Datatype::INT4:
         case Datatype::INT8:
             return GetTypeName<int8_t>();
+        case Datatype::UINT3:
         case Datatype::UINT4:
         case Datatype::UINT8:
             return GetTypeName<uint8_t>();
@@ -1614,6 +1616,13 @@ JitConstants MakeTypeJitConstants(Datatype dataType, const std::string& macroNam
             type_size = "0.25f";
             is_fp = false;
             break;
+        case Datatype::UINT3:
+            type = "uchar";
+            to_type = "convert_uchar(v)";
+            to_type_sat = "convert_uchar_sat(v)";
+            type_size = "0.375f";
+            is_fp = false;
+            break;
         case Datatype::UINT4:
             type = "uchar";
             to_type = "convert_uchar(v)";
@@ -1757,6 +1766,8 @@ JitConstants MakeTypeJitConstants(WeightsType weightsType, const std::string& ma
             return MakeTypeJitConstants(Datatype::UINT8, macroName);
         case WeightsType::UINT2:
             return MakeTypeJitConstants(Datatype::UINT2, macroName);
+        case WeightsType::UINT3:
+            return MakeTypeJitConstants(Datatype::UINT3, macroName);
         case WeightsType::INT4:
             return MakeTypeJitConstants(Datatype::INT4, macroName);
         case WeightsType::UINT4:

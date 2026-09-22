@@ -50,6 +50,9 @@ void ParamsKey::EnableInputDataType(Datatype dt) {
         case Datatype::INT4:
             key.inputType.val.int4 = 1;
             break;
+        case Datatype::UINT3:
+            key.inputType.val.uint3 = 1;
+            break;
         case Datatype::UINT4:
             key.inputType.val.uint4 = 1;
             break;
@@ -106,6 +109,9 @@ void ParamsKey::EnableOutputDataType(Datatype dt) {
     switch (dt) {
         case Datatype::INT4:
             key.outputType.val.int4 = 1;
+            break;
+        case Datatype::UINT3:
+            key.outputType.val.uint3 = 1;
             break;
         case Datatype::UINT4:
             key.outputType.val.uint4 = 1;
@@ -179,6 +185,9 @@ void ParamsKey::EnableInputWeightsType(WeightsType wt) {
         case WeightsType::UINT2:
             key.inputWeightsType.val.uint2 = 1;
             break;
+        case WeightsType::UINT3:
+            key.inputWeightsType.val.uint3 = 1;
+            break;
         case WeightsType::INT32:
             key.inputWeightsType.val.int32 = 1;
             break;
@@ -223,6 +232,9 @@ void ParamsKey::EnableOutputWeightsType(WeightsType wt) {
             break;
         case WeightsType::UINT2:
             key.outputWeightsType.val.uint2 = 1;
+            break;
+        case WeightsType::UINT3:
+            key.outputWeightsType.val.uint3 = 1;
             break;
         case WeightsType::INT32:
             key.outputWeightsType.val.int32 = 1;
