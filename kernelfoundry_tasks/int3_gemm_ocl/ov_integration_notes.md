@@ -83,6 +83,52 @@ compile-time scalar `WEI_ZP` in at unpack time (`v - WEI_ZP`). That is fine for 
 CMake globs sources at configure time, so re-run `cmake build` after adding files or the new
 `.cpp` is silently skipped and you get an undefined-vtable link error.
 
+## STATUS: the kernel is committed but BROKEN end to end - read this first
+
+As of commit `c2b4992fe4` the int3 FC kernel builds, is selected, and is correct on a synthetic
+2-D u3 FC sweep (max rel err < 1%, cosine > 0.9999, no-zp / grouped-zp / scalar-zp, group sizes
+128/64/32, batches 1-129). **But the Qwen3.6-35B-A3B int3 model does not run.** Both attempts
+died on prefill with `CL_OUT_OF_RESOURCES` from `clFinish` (`ocl_stream.cpp:395`), then aborted:
+
+- 1030-token prompt: compiles in 24.6 s, fails on the first `infer()`
+- 27-token prompt: compiles in 15.9 s, same failure
+
+Prefill time, decode time and output coherence are all **NOT MEASURED**. No performance claim
+about this kernel on a real model has been validated. Both failing prompts had batch >= 8, so
+both took the DPAS path; the scalar K-split decode path is untested end to end.
+
+### Leading hypothesis: grouped MoE weights slipping through Validate
+
+This is an MoE model (35B-**A3B**). Its expert FCs likely arrive as grouped matmuls with 3-D
+`[G, N, K]` weights, while `Validate` only checks `weights.IFM()` / `OFM()` against the 2-D
+sizes. Because `GetKernelsPriority` returns `FORCE_PRIORITY_1`, a grouped node that slips
+through is not merely mis-scheduled - it gets indexed as if the weight buffer were flat, which
+is exactly the out-of-bounds access that produces `CL_OUT_OF_RESOURCES`.
+
+If confirmed, the conservative fix is to reject grouped / 3-D weights in `Validate` so those
+nodes fall back, rather than trying to support them immediately.
+
+### Next steps, cheapest first
+
+1. Run `~/SYCL_work/dump_impls.py`. It compiles the model and dumps per-node `execType` from the
+   runtime model **without running inference**, so it answers "is the new kernel actually
+   selected" in ~25 s with no risk of hanging the GPU. Tokenized inputs `ids_short.npy` and
+   `ids_long.npy` are also in `~/SYCL_work/` ready to reuse.
+2. Then chase the `CL_OUT_OF_RESOURCES` via the grouped-weights hypothesis above.
+3. Only once it runs, measure against the performance target below.
+
+Note: a run with `OV_VERBOSE=2` wedged for 15 minutes in `allocate_output` on a u3
+`weights_reorder` constant and had to be killed. That may be a second clue or just verbose-mode
+slowness - it was not possible to distinguish before the machine time ran out.
+
+### The oneDNN `weights_transposed` gate is probably fine
+
+It was suspected of being dead code (which would mean oneDNN still claims u3 and nothing
+speeds up), but a static reading says otherwise: the OCL FC manager in
+`graph/registry/fully_connected_impls.cpp` already requires `weights_transposed` itself, so the
+bypass condition is exactly "decline only when OCL will accept it". Loosening it would strand
+nodes with no implementation at all. Unconfirmed by profiling, but do not "fix" it blindly.
+
 ## Performance target
 Measured on the Qwen3.6-35B-A3B int3 model, prefill: oneDNN `ocl:ref:any__i8` takes ~94 s of a
 98 s prefill. The int4 model through `jit:gemm:any__i8` does 1.26 s prefill and 0.04 s/token
