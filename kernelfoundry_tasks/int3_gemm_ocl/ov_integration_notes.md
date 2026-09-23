@@ -97,16 +97,58 @@ Prefill time, decode time and output coherence are all **NOT MEASURED**. No perf
 about this kernel on a real model has been validated. Both failing prompts had batch >= 8, so
 both took the DPAS path; the scalar K-split decode path is untested end to end.
 
-### Leading hypothesis: grouped MoE weights slipping through Validate
+### MEASURED (2026-09-23): kernel selection, from the compiled exec graph
 
-This is an MoE model (35B-**A3B**). Its expert FCs likely arrive as grouped matmuls with 3-D
-`[G, N, K]` weights, while `Validate` only checks `weights.IFM()` / `OFM()` against the 2-D
-sizes. Because `GetKernelsPriority` returns `FORCE_PRIORITY_1`, a grouped node that slips
-through is not merely mis-scheduled - it gets indexed as if the weight buffer were flat, which
-is exactly the out-of-bounds access that produces `CL_OUT_OF_RESOURCES`.
+Compiling the LM and dumping the runtime graph (no inference needed - the model compiles fine
+in ~16 s, it only dies when executed) gives the real picture. Of 491 FullyConnected nodes:
 
-If confirmed, the conservative fix is to reject grouped / 3-D weights in `Validate` so those
-nodes fall back, rather than trying to support them immediately.
+| count | weights | runtime | primitive |
+| --- | --- | --- | --- |
+| 351 | u8 | i8 | oneDNN (`undef`) |
+| 130 | **u3** | f16 | `fully_connected_gpu_bfyx_ref__f16` |
+| 10 | **u3** | f16 | `fully_connected_gpu_int3_dpas__f16` |
+
+Broken down by input shape:
+
+| count | primitive | activation \| weights shapes |
+| --- | --- | --- |
+| 40 | bfyx_ref | `256x-1x2048` |
+| 40 | bfyx_ref | `256x-1x2048 \| 256x-1x512` |
+| 40 | bfyx_ref | `256x-1x512` |
+| 10 | bfyx_ref | `-1x-1x4096 \| -1x-1x2048` |
+| 10 | **int3_dpas** | `-1x-1x2048` |
+
+Conclusions, which correct the earlier guesses:
+
+1. **The `weights_transposed` gate is NOT dead.** The new kernel really is selected - for 10
+   nodes. That question is settled.
+2. **`Validate` is doing its job on grouped weights.** The MoE expert matmuls have a leading
+   dimension of 256 (256 experts) and are rejected, so they are NOT the source of an
+   out-of-bounds write. The earlier "grouped weights slip through and index a flat buffer"
+   hypothesis is **disproved** - those nodes never reach the kernel.
+3. **The real performance problem is coverage, not the kernel.** 130 of 140 u3 nodes - including
+   all 120 grouped MoE expert matmuls that dominate runtime - land on
+   `fully_connected_gpu_bfyx_ref`, a reference kernel. Only 10 get the fast path. Even a perfect
+   int3 GEMM on those 10 cannot move the needle.
+4. **Caution - this may be a self-inflicted regression.** Before this work those MoE matmuls ran
+   on oneDNN `ocl:ref:any__i8`. Enabling `WeightsType::UINT3` in `fully_connected_kernel_bfyx_ref`
+   diverted them to OpenVINO's own reference kernel instead. Whether that is faster, slower or
+   buggier than the oneDNN reference has not been measured, and `bfyx_ref` handling 3-D grouped
+   u3 weights is itself unproven - it is a candidate for the `CL_OUT_OF_RESOURCES` crash.
+
+### Where the crash most likely is now
+
+With grouped nodes excluded from the new kernel, the remaining suspects are (a) the 10
+`-1x-1x2048` nodes that DO run `int3_dpas`, and (b) `bfyx_ref` on 3-D grouped u3 weights. A
+cheap way to separate them: temporarily make `Validate` reject everything (or lower the
+priority) so no node uses `int3_dpas`, and see whether the crash persists. If it does, the bug
+is in the u3 `bfyx_ref` path, not in the new kernel.
+
+### What actually needs to happen for the performance win
+
+The grouped MoE expert matmul is the shape that matters, and neither the new kernel nor any
+tuned path currently handles it. Supporting a leading expert dimension - looping or dispatching
+over G with a per-expert weight base offset - is the highest-value remaining work.
 
 ### Next steps, cheapest first
 
