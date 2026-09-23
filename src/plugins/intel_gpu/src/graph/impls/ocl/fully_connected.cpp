@@ -8,9 +8,6 @@
 #include "fully_connected/fully_connected_kernel_selector.h"
 #include "fully_connected/fully_connected_params.h"
 
-#include <cstdlib>
-#include <iostream>
-
 namespace cldnn {
 namespace ocl {
 
@@ -135,26 +132,12 @@ public:
             return layouts;
         };
 
-        auto get_fc_output_layout = [primitive](const std::vector<layout>& input_layouts,
-                                                const ov::PartialShape& orig_weights_pshape,
-                                                const layout& output_layout,
-                                                bool swiglu_fused) {
+        auto get_fc_output_layout = [primitive](const std::vector<layout>& input_layouts, const layout& output_layout, bool swiglu_fused) {
             auto updated_out_layout = output_layout;
 
             auto input0_pshape = input_layouts[0].get_partial_shape();
             auto input1_pshape = input_layouts[1].get_partial_shape();
-            auto out_features_dim = primitive->weights_transposed ? input1_pshape[0] : input1_pshape[1];
-
-            // Weights that arrive with a leading expert dimension ([G, N, K] from a grouped
-            // MoE matmul) have already been flattened to [G*N, K] above, so the dimension
-            // read back here is G*N. The output keeps G as its batch, so its feature size is
-            // still N - taking G*N would describe a buffer G times larger than the one that
-            // is actually allocated and the kernel would be dispatched past the end of it.
-            if (primitive->input_size == 3 && orig_weights_pshape.size() == 3) {
-                const auto& n_dim = primitive->weights_transposed ? orig_weights_pshape[1] : orig_weights_pshape[2];
-                out_features_dim = n_dim;
-            }
-
+            const auto out_features_dim = primitive->weights_transposed ? input1_pshape[0] : input1_pshape[1];
             ov::PartialShape updated_out_pshape {input0_pshape[0], out_features_dim};
             const auto output_feature_size = swiglu_fused ? out_features_dim / 2 : out_features_dim;
 
@@ -176,26 +159,13 @@ public:
             }
         }
 
-        const auto orig_weights_pshape = impl_param.input_layouts[1].get_partial_shape();
         const auto input_layouts = get_fc_input_layouts(impl_param.input_layouts, allow_new_shape_infer);
         for (size_t i = 0; i < input_layouts.size(); ++i) {
             updated_impl_param.input_layouts[i] = input_layouts[i];
         }
         updated_impl_param.weights_layout = input_layouts[1];
 
-        updated_impl_param.output_layouts[0] =
-            get_fc_output_layout(input_layouts, orig_weights_pshape, impl_param.get_output_layout(), swiglu_fused);
-
-        // TEMPORARY DEBUG PROBE - remove before commit.
-        if (std::getenv("OV_FC_PARAM_PROBE") && impl_param.desc->id.find("bmm/MatMul_1") != std::string::npos) {
-            std::cerr << "[fcparam] " << impl_param.desc->id << " input_size=" << primitive->input_size
-                      << " weights_rank=" << primitive->weights_rank
-                      << " transposed=" << primitive->weights_transposed << "\n"
-                      << "          orig wei  " << orig_weights_pshape << "\n"
-                      << "          upd  wei  " << updated_impl_param.weights_layout.value().to_short_string() << "\n"
-                      << "          upd  in0  " << updated_impl_param.input_layouts[0].to_short_string() << "\n"
-                      << "          upd  out  " << updated_impl_param.output_layouts[0].to_short_string() << std::endl;
-        }
+        updated_impl_param.output_layouts[0] = get_fc_output_layout(input_layouts, impl_param.get_output_layout(), swiglu_fused);
 
         return updated_impl_param;
     }

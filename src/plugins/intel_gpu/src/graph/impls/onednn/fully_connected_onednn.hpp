@@ -10,6 +10,7 @@
 #include "intel_gpu/runtime/debug_configuration.hpp"
 #include <memory>
 #include <cmath>
+#include <cstdlib>
 
 #define LOG_AND_RETURN_FALSE(node) do {                                         \
     GPU_DEBUG_TRACE << (node).id() << " :  Do not select onednn" << std::endl;  \
@@ -70,7 +71,9 @@ struct FullyConnectedImplementationManager : public ImplementationManager {
         // oneDNN has no optimized kernel for u3 weights and falls back to ocl:ref,
         // which is orders of magnitude slower than the OCL int3 GEMM. Hand those
         // over, but only when the OCL manager will actually accept the node.
-        if (wei_dt == data_types::u3 && fc_prim->weights_transposed)
+        // TEMPORARY BISECT GATE - remove before commit.
+        static const bool u3_bypass_disabled = std::getenv("OV_DISABLE_ONEDNN_U3_BYPASS") != nullptr;
+        if (wei_dt == data_types::u3 && fc_prim->weights_transposed && !u3_bypass_disabled)
             LOG_AND_RETURN_FALSE(node);
 
         if (fc_prim->compressed_weights) {
