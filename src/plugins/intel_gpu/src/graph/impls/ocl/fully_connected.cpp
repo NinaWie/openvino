@@ -132,12 +132,26 @@ public:
             return layouts;
         };
 
-        auto get_fc_output_layout = [primitive](const std::vector<layout>& input_layouts, const layout& output_layout, bool swiglu_fused) {
+        auto get_fc_output_layout = [primitive](const std::vector<layout>& input_layouts,
+                                                const ov::PartialShape& weights_pshape_orig,
+                                                const layout& output_layout,
+                                                bool swiglu_fused) {
             auto updated_out_layout = output_layout;
 
             auto input0_pshape = input_layouts[0].get_partial_shape();
             auto input1_pshape = input_layouts[1].get_partial_shape();
-            const auto out_features_dim = primitive->weights_transposed ? input1_pshape[0] : input1_pshape[1];
+            auto out_features_dim = primitive->weights_transposed ? input1_pshape[0] : input1_pshape[1];
+
+            // A grouped MoE weight arrives as [G, N, K] and get_fc_input_layouts has
+            // already flattened it to [G*N, K]. Reading the output feature size off
+            // that flattened weight would describe the output as [G, M, G*N] - G
+            // times the buffer actually allocated - so take one expert's N from the
+            // original shape instead.
+            if (primitive->input_size == 3 && weights_pshape_orig.size() == 3) {
+                out_features_dim =
+                    primitive->weights_transposed ? weights_pshape_orig[1] : weights_pshape_orig[2];
+            }
+
             ov::PartialShape updated_out_pshape {input0_pshape[0], out_features_dim};
             const auto output_feature_size = swiglu_fused ? out_features_dim / 2 : out_features_dim;
 
@@ -165,7 +179,10 @@ public:
         }
         updated_impl_param.weights_layout = input_layouts[1];
 
-        updated_impl_param.output_layouts[0] = get_fc_output_layout(input_layouts, impl_param.get_output_layout(), swiglu_fused);
+        updated_impl_param.output_layouts[0] = get_fc_output_layout(input_layouts,
+                                                                    impl_param.input_layouts[1].get_partial_shape(),
+                                                                    impl_param.get_output_layout(),
+                                                                    swiglu_fused);
 
         return updated_impl_param;
     }

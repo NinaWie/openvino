@@ -227,3 +227,171 @@ Historical note: an earlier entry here recorded ~98 s prefill with ~94 s of it i
 `ocl:ref:any__i8`. **That prefill figure does not reproduce** - the true un-regressed baseline
 measured 167.88 s on 2026-09-23. The 6.3 s/token decode figure does reproduce. Re-establish
 the 98 s before treating it as a target.
+
+## MEASURED (2026-09-23, post-regression-fix): where the 140 u3 nodes actually go
+
+The selection table earlier in this file was taken *before* the two regressions were fixed,
+when the DynamicQuantize skip still applied to every u3 node and pushed the grouped MoE
+matmuls onto `bfyx_ref` at f16. With both fixes in, the picture is different and this is the
+one to work from. Of 491 `FullyConnected` nodes (`~/SYCL_work/dump_impls2.py`):
+
+| count | primitive | runtime prec | role |
+| --- | --- | --- | --- |
+| 471 | oneDNN (reported as `undef`) | i8 | 351 u8-weight projections **+ the 120 u3 MoE expert bmms** |
+| 10 | `fully_connected_gpu_int3_dpas__f16` | f16 | `self_attn.q_proj` (fused 3 FCs) - our kernel |
+| 10 | `fully_connected_gpu_bfyx_ref__f16` | f16 | `self_attn.o_proj` |
+
+The 120 MoE expert GEMMs are named `layers.N.mlp/ov_ext::bmm/MatMul{,_1,_2}`, i.e. three
+batched matmuls per layer over 40 layers - gate, up and down. Two things about them matter:
+
+1. **They are `FullyConnected` primitives, not `moe_gemm`.** The plugin does have a full
+   dedicated MoE primitive family (`moe_gemm`, `moe_3gemm_fused_compressed`, with ocl_v2 and
+   oneDNN impls under `src/graph/impls/ocl_v2/moe/`), but **none of it is instantiated for
+   this model** - the runtime graph contains zero `moe_gemm` nodes. Only the router is fused,
+   as 40 `moe_router_fused` nodes. So extending our FC kernel to rank-3 weights is the route
+   to these nodes; adopting the `moe_gemm` primitive would be a much larger change.
+2. **They already run at i8.** `runtimePrecision = i8` and there are 221 `DynamicQuantize`
+   nodes, so the int8 activation path our kernel needs is already in place for them. This is
+   also the evidence that the narrowed DynamicQuantize skip is behaving correctly.
+
+Note also that the 10 `self_attn.o_proj` nodes are u3 on a *reference* kernel. They are 2-D
+weights, so they are in scope for the existing kernel, and finding out why `Validate` rejects
+them is a much smaller job than the MoE work - worth doing first if a quick win is wanted.
+(K=4096 there, and `get_quantize_group_size` is capped at 128/64/32, so the group-size or the
+fused-op check are the first places to look.)
+
+### Note on `dump_impls.py` vs `dump_impls2.py`
+
+The original `dump_impls.py` serializes the runtime model with `ov.save_model` and parses the
+XML. On this 35B model that writes a multi-gigabyte `.bin` and does not finish inside a 600 s
+timeout (that is the `EXIT=124` in `/tmp/gate2.log`, not a compile hang). `dump_impls2.py`
+reads `rt_info` in memory instead and takes ~15 s. The impl name is under the key
+**`primitiveType`**, not `execType`; `execType` does not exist on these nodes, which is why an
+earlier version of the script reported `?` for everything.
+
+## MEASURED (2026-09-23): profiling settles where the time goes
+
+27-token prefill with PERF_COUNT on (`run_qwen_int3.py --profile`), total 166.0 s:
+
+| nodes | time | share | what |
+| --- | --- | --- | --- |
+| 120 | **165.4 s** | **99.6%** | MoE expert bmms, oneDNN `ocl:ref:any__i8` |
+| 10 | 0.12 s | 0.1% | `self_attn.o_proj`, `fully_connected_gpu_bfyx_ref__f16` |
+| 351 | 0.04 s | 0.02% | dense u8 projections, oneDNN `jit:gemm:any__i8` |
+| 10 | 0.006 s | 0.004% | `self_attn.q_proj`, `fully_connected_gpu_int3_dpas__f16` |
+
+oneDNN serves the u8 projections from its optimized JIT path and finishes 351 of
+them in 39 ms, but has no tuned kernel for grouped u3 and drops to `ocl:ref`.
+Each expert node spends 1378 ms streaming ~100 MB of u3 weights, i.e. 0.07 GB/s
+against the 88-96 GB/s the KernelFoundry MoE kernel reaches on the same shapes -
+about a thousand times off. This is also what makes prefill scale linearly with
+prompt length (166 s at 27 tokens, 390 s at 64, 781 s at 128 - a flat
+6.1 s/token, i.e. no weight reuse at all).
+
+Projected if the 120 nodes ran at the KernelFoundry kernel's measured speed:
+80 gate/up at 1.11 ms + 40 down at 1.18 ms = ~136 ms, so prefill well under 1 s
+against the 1.26 s int4 bar. 1.1 ms/node is the DRAM floor for 100 MB, so there
+is little room below that.
+
+## WIP (2026-09-23): grouped MoE expert support in the int3 kernel
+
+Committed as work in progress. **Builds clean; NOT yet numerically verified, and
+inference has not been run since the last change.** See the warning below.
+
+The KernelFoundry side is done and validated: `kernelfoundry_tasks/int3_moe_gemm_ocl`
+(commit `90dc4e5f0b`) passes 13 correctness cases on Panther Lake and runs the
+model's MoE shapes at 88-96 GB/s for gate/up and 58-70 GB/s for down_proj, 92.8x
+over the naive reference. Tuning there found the two shape families want opposite
+configs: the knob is the reuse product `tile_m * sg_m` (drive it to 64), but
+gate/up (GROUPS_K=16) wants it split as `tile_m 16 x sg_m 4` while down_proj
+(GROUPS_K=4, too few groups to amortize the staging barriers) wants `tile_m 64 x
+sg_m 1`, worth 1.46x. Beware: a benchmark run heats the part enough to move the
+same config from 1.71 ms to 2.44 ms, so only orderings measured within one run at
+comparable positions mean anything.
+
+### What was changed in the plugin
+
+1. `fully_connected_gpu_int3_dpas.cl` - expert index from a third grid dimension,
+   contributing a base offset to the weights (`B_UINTS_PER_EXPERT`), to the scale
+   and zero point (`n_global`) and to the row index (`row_base`). Rows are tiled
+   within one expert and never across two, because a row tile shares one weight
+   unpack. With `GROUPED_WEIGHTS == 0` the expert is a compile-time zero and every
+   offset folds away, so the non-grouped path is unchanged.
+2. `WEI_SCALE` now addresses the scale as a contiguous `[G*N, groups]` table via
+   new `WEI_SCALE_GROUPS_K` / `WEI_SCALE_GROUP_SIZE` jit constants, instead of the
+   `DECOMPRESSION_SCALE_*` pitches, which describe the unflattened tensor.
+3. `fully_connected_kernel_int3_dpas.{h,cpp}` - `get_expert_count` (weights OFM /
+   output OFM), `get_rows_per_expert`, expert dimension in `get_gemm_dispatch`,
+   and the DPAS-vs-scalar choice now keyed on **rows per expert** rather than the
+   flattened batch (with 256 experts the flattened batch is large even at one row
+   each). `Validate` accepts a grouped weight after checking the output is 3D
+   `[G, M, N]` with G in its batch dimension, and rejects grouped + non-scalar zp.
+4. **`get_scale_groups_k` replaces bf_tiled's `get_scale_group_size`.** That helper
+   reads the group count off the scale's `Feature()`, which is right for a 2D
+   weight (scale `[N, groups]`) but wrong for a grouped one (scale `[G, N, groups]`,
+   where `Feature()` is N). It silently returned a group size of 4 instead of 128
+   and was why `Validate` still rejected all 120 nodes after the first build.
+   Deriving the count from total scale elements / weight rows is right for both.
+5. `impls/ocl/fully_connected.cpp` - `get_fc_output_layout` takes the original
+   weights shape and, for a grouped weight, derives the output feature size from
+   one expert's N instead of the flattened `G*N`. Without this the output is
+   described as `[G, M, G*N]` and the kernel is dispatched over a shape G times
+   the allocated buffer - this is the page fault behind `11237b3bdc`.
+6. The two gates widened from rank 2 to ranks 2 and 3, **together**:
+   the oneDNN u3 bypass in `fully_connected_onednn.hpp`, and the DynamicQuantize
+   skip in `transformations_pipeline.cpp`. These MUST move in step. A node that
+   keeps its graph-level DynamicQuantize but is then handed to the int3 kernel
+   (which quantizes internally and wants f16 in) loses the int8 path; the reverse
+   leaves it on oneDNN at f16. Each mistake cost a separate regression earlier.
+
+### Where this was left - kernel selection, confirmed
+
+`dump_impls2.py` after all the fixes above. Note it now takes **~300 s** rather
+than 15 s, because the OpenCL JIT has many more kernel variants to build; that is
+expected, not a hang. Of 491 `FullyConnected` nodes:
+
+| count | primitive | which |
+| --- | --- | --- |
+| 351 | oneDNN (`undef`) | dense u8 projections, unchanged |
+| **90** | **`fully_connected_gpu_int3_dpas__f16`** | 80 expert `bmm/MatMul_1` + `MatMul_2`, and the 10 `q_proj` |
+| 50 | `fully_connected_gpu_bfyx_ref__f16` | 40 expert `bmm/MatMul`, and the 10 `o_proj` |
+
+So **80 of the 120 expert GEMMs now reach the tuned kernel** - the gate and up
+projections (N=512, K=2048), which by the profile are 80 of the 120 nodes and
+roughly two thirds of the 165 s. The 40 still on `bfyx_ref` are the first bmm of
+each layer, i.e. **down_proj (N=2048, K=512)**, plus the 10 `o_proj` that were
+already there.
+
+Why down_proj is still rejected has NOT been diagnosed. It is not the scale group
+size (K=512, group 128 divides cleanly) nor the block alignment (N=2048 % 16 == 0,
+K=512 % 32 == 0) nor the expert count (524288 / 2048 == 256). The untested
+suspect is `!fc_params.fused_ops.empty()`: a MoE down_proj output is scaled by the
+router weight, which may arrive fused. Add a `GPU_DEBUG` print to each
+`DO_NOT_USE_THIS_KERNEL` in `Validate` and compile once to find out - that is a
+5-minute job and the right place to start next session.
+
+### !! Do not trust inference results yet
+
+The 40 grouped down_proj nodes sitting on `bfyx_ref` are **numerically wrong, not
+crashing**. The page fault that this configuration used to cause is fixed by
+change (5) above, so the model will now most likely run to completion - but
+`fully_connected_gpu_bfyx_ref` calls `GET_FILTER_INDEX` with a hardcoded group
+index of 0, so all 256 experts would use expert 0's weights. Silently wrong output
+is the expected failure mode. Verify token IDs before believing any timing.
+
+### Next steps, in order
+
+1. Find out why down_proj is rejected (see above) and get all 120 nodes onto
+   `int3_dpas`. Until then the fast path is incomplete and results are wrong.
+2. Then run inference and check the generated token IDs against the known good
+   prefix `[248068, 198, 90700, 8340, 25, 271, 16, 13]` for `ids_short.npy`. A
+   wrong expert offset shows up as plausible-looking but different text, so the
+   ID check is the real gate, not whether it runs.
+3. Measure prefill against the 166.0 s baseline; expect order 1 s if the
+   projection holds. Re-profile to confirm the expert nodes left `ocl:ref`.
+4. Port the KernelFoundry per-shape configs (above) into `get_dpas_config`, which
+   currently hardcodes `tile_m 32` and picks `sg_m` from divisibility alone and so
+   will not choose `tile_m 64 x sg_m 1` for down_proj.
+5. Revert the two debug aids, still uncommitted in the working tree: the
+   per-primitive sync probe in `network.cpp` and the `OV_DISABLE_INT3_DPAS` gate
+   in `fully_connected_kernel_int3_dpas.cpp`. Both are marked TEMPORARY.

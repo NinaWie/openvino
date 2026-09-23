@@ -49,6 +49,25 @@
 // workgroups to fill the machine and the unpack has nothing to amortize against.
 // There USE_DPAS is off and SG_K subgroups split the K range instead, each
 // accumulating a partial dot product that is reduced through SLM at the end.
+//
+// Grouped (MoE expert) weights
+// ----------------------------
+// With GROUPED_WEIGHTS the primitive is a batched matmul over NUM_EXPERTS expert
+// matrices: activations [G, M, K], weights [G*N, K], output [G, M, N], computing
+// C[e] = A[e] x W[e]^T for each expert independently. This is how the Qwen3.6
+// MoE gate / up / down projections arrive.
+//
+// It costs almost nothing here. OpenVINO flattens the weight expert-major, so
+// row (e*N + n) is output n of expert e, and N is a multiple of the 16-channel
+// block; the blocked layout of the flattened weight is therefore already a
+// contiguous stack of per-expert slices. Likewise the flattened activation batch
+// is expert-major, so row (e*M + m) is row m of expert e. The expert index is
+// consequently just a base offset on the weights, the scale / zero point and the
+// row index, taken from a third grid dimension so that a row tile never straddles
+// two experts (it must not: one weight unpack serves the whole tile).
+//
+// With NUM_EXPERTS == 1 the expert is a compile-time zero and every offset below
+// folds away, leaving the non-grouped code path unchanged.
 
 #if FC_KERNEL_DYNAMIC_QUANTIZE
 
@@ -119,6 +138,17 @@ KERNEL(quantize_input)(
 #define A_UINTS_PER_ROW  (TILE_IN_B_PITCH / 4)
 #define A_UINTS_PER_CHUNK (K_CHUNK / 4)
 
+// Rows of one expert, and one expert's slice of the packed weights in uints.
+// BATCH_SIZE counts every expert's rows, so the per-expert row count is the
+// output feature dimension when the weights are grouped.
+#if GROUPED_WEIGHTS
+#define ROWS_PER_EXPERT  (OUTPUT_FEATURE_NUM)
+#else
+#define ROWS_PER_EXPERT  (BATCH_SIZE)
+#endif
+#define N_BLOCKS_PER_EXPERT (TILE_OUT_F_NUM / SIMD)
+#define B_UINTS_PER_EXPERT  (N_BLOCKS_PER_EXPERT * CHUNKS_K * CHUNK_UINTS)
+
 // Quantization groups staged into SLM per barrier, so that every subgroup has at
 // least one granule to decode.
 #if SG_M > CHUNKS_PER_GROUP
@@ -177,9 +207,13 @@ KERNEL(quantize_input)(
            as_int(U3_CHAR4(w0, w1, w2, 16)), as_int(U3_CHAR4(w0, w1, w2, 20)),      \
            as_int(U3_CHAR4(w0, w1, w2, 24)), as_int(U3_CHAR4(w0, w1, w2, 28)))
 
+// The scale is a contiguous [G*N, WEI_SCALE_GROUPS_K] table indexed by output
+// channel in the flattened weight space, so one expression covers the grouped and
+// the plain case alike (G == 1 for the latter). Going through the
+// DECOMPRESSION_SCALE_* pitches instead would describe the unflattened
+// [G, N, groups] tensor and address the wrong element for a grouped weight.
 #define WEI_SCALE(n, k)                                                             \
-    ((float)(decompression_scale[((n) % DECOMPRESSION_SCALE_BATCH_NUM) * DECOMPRESSION_SCALE_BATCH_PITCH \
-                                 + ((k) / DECOMPRESSION_SCALE_GROUP_SIZE) * DECOMPRESSION_SCALE_FEATURE_PITCH]))
+    ((float)(decompression_scale[(n) * WEI_SCALE_GROUPS_K + (k) / WEI_SCALE_GROUP_SIZE]))
 
 #if DECOMPRESSION_ZP_TERM
 #   if DECOMPRESSION_ZP_SCALAR
@@ -222,10 +256,22 @@ KERNEL(fc)(
     const uint nb   = (uint)get_group_id(0);
     const uint n    = nb * SIMD + lane;
 
-    const uint batch_size = BATCH_SIZE;
     const uint var_pitch  = TILE_IN_B_PITCH / QUANTIZE_GROUP_SIZE;
 
-    const __global uint* B = (const __global uint*)weights;
+#if GROUPED_WEIGHTS
+    const uint expert = (uint)get_group_id(2);
+#else
+    const uint expert = 0;
+#endif
+    // Rows are indexed within the expert; row_base lifts them back into the
+    // flattened, expert-major activation and output tensors.
+    const uint batch_size = ROWS_PER_EXPERT;
+    const uint row_base   = expert * batch_size;
+    // Output channel in the flattened [G*N] weight space, for the scale and the
+    // zero point, both of which are indexed per output channel.
+    const uint n_global   = expert * TILE_OUT_F_NUM + n;
+
+    const __global uint* B = (const __global uint*)weights + (size_t)expert * B_UINTS_PER_EXPERT;
 
     float out[TILE_M];
     unroll_for (uint t = 0; t < TILE_M; ++t)
@@ -273,9 +319,9 @@ KERNEL(fc)(
 #endif
             }
 
-            const float bs = WEI_SCALE(n, g * GROUP_SIZE);
+            const float bs = WEI_SCALE(n_global, g * GROUP_SIZE);
 #if DECOMPRESSION_ZP_TERM
-            const float bzp = WEI_ZP(n, g * GROUP_SIZE);
+            const float bzp = WEI_ZP(n_global, g * GROUP_SIZE);
 #endif
 
             unroll_for (uint mb = 0; mb < M_BLOCKS; ++mb) {
@@ -288,7 +334,7 @@ KERNEL(fc)(
                 float asum[8];
 #endif
                 unroll_for (uint t = 0; t < 8; ++t) {
-                    const uint row = min(m0 + mb * 8 + t, batch_size - 1);
+                    const uint row = row_base + min(m0 + mb * 8 + t, batch_size - 1);
                     const __global ushort* ap = (const __global ushort*)(
                         quantized_input + row * TILE_IN_B_PITCH + g * GROUP_SIZE);
 #if CHUNKS_PER_GROUP == 4
@@ -353,7 +399,7 @@ KERNEL(fc)(
             const char4 v7 = U3_CHAR4(w0, w1, w2, 28);
 
             unroll_for (uint t = 0; t < TILE_M; ++t) {
-                const uint row = min(m0 + t, batch_size - 1);
+                const uint row = row_base + min(m0 + t, batch_size - 1);
                 const __global uint* ap = (const __global uint*)quantized_input +
                                           row * A_UINTS_PER_ROW + chunk * A_UINTS_PER_CHUNK;
                 int a = acc[t];
@@ -369,12 +415,12 @@ KERNEL(fc)(
             }
         }
 
-        const float bs = WEI_SCALE(n, g * GROUP_SIZE);
+        const float bs = WEI_SCALE(n_global, g * GROUP_SIZE);
 #if DECOMPRESSION_ZP_TERM
-        const float bzp = WEI_ZP(n, g * GROUP_SIZE);
+        const float bzp = WEI_ZP(n_global, g * GROUP_SIZE);
 #endif
         unroll_for (uint t = 0; t < TILE_M; ++t) {
-            const uint row = min(m0 + t, batch_size - 1);
+            const uint row = row_base + min(m0 + t, batch_size - 1);
             const uint qv = (row * var_pitch + g) * 2;
             float part = (float)acc[t];
 #if DECOMPRESSION_ZP_TERM
@@ -410,9 +456,10 @@ KERNEL(fc)(
         if (row < batch_size) {
             float res = out[t];
 #if BIAS_TERM
-            res += (float)biases[n];
+            res += (float)biases[n_global];
 #endif
-            const uint output_offset = n * TILE_OUT_F_PITCH + row * TILE_OUT_B_PITCH + OUTPUT_OFFSET;
+            const uint output_offset =
+                n * TILE_OUT_F_PITCH + (row_base + row) * TILE_OUT_B_PITCH + OUTPUT_OFFSET;
             output[output_offset] = TO_OUTPUT_TYPE(ACTIVATION_TYPED(res, ACTIVATION_PARAMS_TYPED));
         }
     }
@@ -428,6 +475,9 @@ KERNEL(fc)(
 #undef M_BLOCKS
 #undef A_UINTS_PER_ROW
 #undef A_UINTS_PER_CHUNK
+#undef ROWS_PER_EXPERT
+#undef N_BLOCKS_PER_EXPERT
+#undef B_UINTS_PER_EXPERT
 #undef GROUPS_PER_ITER
 #undef CHUNKS_PER_ITER
 #undef CHUNKS_PER_SG
