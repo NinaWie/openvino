@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -1725,10 +1726,14 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
                         return true;
                     }
                 }
-                // u3 weights run on the OCL int3 GEMM, which quantizes the
-                // activations itself; a graph-level DynamicQuantize would hand it
-                // an activation scale it has no argument slot for.
-                if (root->get_input_element_type(1) == ov::element::u3) {
+                // u3 weights with a plain 2D weight matrix run on the OCL int3 GEMM, which
+                // quantizes the activations itself; a graph-level DynamicQuantize would hand
+                // it an activation scale it has no argument slot for. Weights with a leading
+                // expert dimension (a grouped MoE matmul) never reach that kernel - they stay
+                // on oneDNN - so they must keep their dynamic quantization, otherwise they
+                // lose the int8 activation path and fall back to a much slower f16 one.
+                if (root->get_input_element_type(1) == ov::element::u3 &&
+                    root->get_input_partial_shape(1).size() == 2) {
                     GPU_DEBUG_TRACE << root->get_friendly_name() << "  dyn_quan is turned off: u3 weights are handled in-kernel"
                                     << std::endl;
                     return true;

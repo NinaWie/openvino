@@ -10,7 +10,6 @@
 #include "intel_gpu/runtime/debug_configuration.hpp"
 #include <memory>
 #include <cmath>
-#include <cstdlib>
 
 #define LOG_AND_RETURN_FALSE(node) do {                                         \
     GPU_DEBUG_TRACE << (node).id() << " :  Do not select onednn" << std::endl;  \
@@ -79,10 +78,8 @@ struct FullyConnectedImplementationManager : public ImplementationManager {
         // No OCL FC kernel indexes the expert dimension either - GET_FILTER_INDEX is called
         // with a hardcoded group index of 0 - so results would be wrong even once the shape
         // is consistent.
-        // TEMPORARY BISECT GATE - remove once the bypass change is confirmed on GPU.
-        static const bool u3_bypass_disabled = std::getenv("OV_DISABLE_ONEDNN_U3_BYPASS") != nullptr;
         const bool u3_weights_are_2d = fc_node.weights().get_output_layout(false).get_partial_shape().size() == 2;
-        if (wei_dt == data_types::u3 && fc_prim->weights_transposed && u3_weights_are_2d && !u3_bypass_disabled)
+        if (wei_dt == data_types::u3 && fc_prim->weights_transposed && u3_weights_are_2d)
             LOG_AND_RETURN_FALSE(node);
 
         if (fc_prim->compressed_weights) {
