@@ -8,6 +8,7 @@
 #include "common_types.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <vector>
 
 namespace kernel_selector {
@@ -188,6 +189,9 @@ DeviceFeaturesKey FullyConnected_int3_dpas::get_required_device_features_key(con
 }
 
 bool FullyConnected_int3_dpas::Validate(const Params& params) const {
+    if (std::getenv("OV_DISABLE_INT3_DPAS"))
+        DO_NOT_USE_THIS_KERNEL(params.layerID);
+
     if (!Parent::Validate(params))
         DO_NOT_USE_THIS_KERNEL(params.layerID);
 
