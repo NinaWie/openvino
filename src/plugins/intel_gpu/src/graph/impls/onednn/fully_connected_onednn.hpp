@@ -68,12 +68,21 @@ struct FullyConnectedImplementationManager : public ImplementationManager {
         if (!f16f16_case && !bf16bf16_case && !f32f32_case && !u8s8_case && !compressed_case && !fp_compressed_case)
             LOG_AND_RETURN_FALSE(node);
 
-        // oneDNN has no optimized kernel for u3 weights and falls back to ocl:ref,
-        // which is orders of magnitude slower than the OCL int3 GEMM. Hand those
-        // over, but only when the OCL manager will actually accept the node.
-        // TEMPORARY BISECT GATE - remove before commit.
+        // oneDNN has no optimized kernel for u3 weights and falls back to ocl:ref, which is
+        // orders of magnitude slower than the OCL int3 GEMM, so hand those nodes over - but
+        // only plain 2D weights, which is all the OCL path can represent. Weights with a
+        // leading expert dimension (a grouped MoE matmul, [G, N, K]) have to stay here:
+        // fully_connected_impl::update_impl_params flattens them to [G*N, K] and then reads
+        // the 3D output feature size back off that flattened OFM, describing the output as
+        // [G, M, G*N] instead of [G, M, N]. The kernel is then dispatched over a shape G
+        // times larger than the buffer that was actually allocated and writes past its end.
+        // No OCL FC kernel indexes the expert dimension either - GET_FILTER_INDEX is called
+        // with a hardcoded group index of 0 - so results would be wrong even once the shape
+        // is consistent.
+        // TEMPORARY BISECT GATE - remove once the bypass change is confirmed on GPU.
         static const bool u3_bypass_disabled = std::getenv("OV_DISABLE_ONEDNN_U3_BYPASS") != nullptr;
-        if (wei_dt == data_types::u3 && fc_prim->weights_transposed && !u3_bypass_disabled)
+        const bool u3_weights_are_2d = fc_node.weights().get_output_layout(false).get_partial_shape().size() == 2;
+        if (wei_dt == data_types::u3 && fc_prim->weights_transposed && u3_weights_are_2d && !u3_bypass_disabled)
             LOG_AND_RETURN_FALSE(node);
 
         if (fc_prim->compressed_weights) {

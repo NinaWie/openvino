@@ -40,8 +40,6 @@
 #include "to_string_utils.h"
 
 #include <algorithm>
-#include <cstdlib>
-#include <iostream>
 #include <string>
 #include <vector>
 #include <stack>
@@ -963,28 +961,6 @@ void network::execute_impl(const std::vector<event::ptr>& events) {
 
         inst->prepare_primitive();
         inst->execute();
-
-        // TEMPORARY DEBUG PROBE - remove before commit.
-        static const bool sync_probe = std::getenv("OV_SYNC_PROBE") != nullptr;
-        if (sync_probe) {
-            const auto& pp = *inst->get_impl_params();
-            std::cerr << "[probe] " << inst->id() << " (" << pp.desc->type_string() << ")" << std::endl;
-            if (pp.desc->type_string() == std::string("fully_connected")) {
-                for (size_t i = 0; i < pp.input_layouts.size(); i++)
-                    std::cerr << "[probe]   in[" << i << "]  " << pp.input_layouts[i].to_short_string() << std::endl;
-                for (size_t i = 0; i < pp.output_layouts.size(); i++)
-                    std::cerr << "[probe]   out[" << i << "] " << pp.output_layouts[i].to_short_string() << std::endl;
-                if (pp.weights_layout.has_value())
-                    std::cerr << "[probe]   wei   " << pp.weights_layout.value().to_short_string()
-                              << " bytes=" << pp.weights_layout.value().bytes_count() << std::endl;
-                for (size_t i = 0; i < inst->dependencies().size(); i++) {
-                    auto m = inst->dep_memory_ptr(i);
-                    std::cerr << "[probe]   dep[" << i << "] mem_bytes=" << (m ? m->size() : 0) << std::endl;
-                }
-            }
-            get_stream().finish();
-            std::cerr << "[probe]   ok" << std::endl;
-        }
 
         executed_prims++;
         if (needs_flushing && executed_prims % flush_frequency == 0)
