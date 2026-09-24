@@ -8,6 +8,7 @@
 #include "common_types.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <vector>
 
 namespace kernel_selector {
@@ -246,6 +247,11 @@ bool FullyConnected_int3_dpas::Validate(const Params& params) const {
     if (!Parent::Validate(params))
         DO_NOT_USE_THIS_KERNEL(params.layerID);
 
+    // TEMPORARY: OV_INT3_BASELINE disables this kernel for A/B runs.
+    static const bool int3_baseline = std::getenv("OV_INT3_BASELINE") != nullptr;
+    if (int3_baseline)
+        DO_NOT_USE_THIS_KERNEL(params.layerID);
+
     const auto& fc_params = static_cast<const fully_connected_params&>(params);
     const auto& input = fc_params.inputs[0];
     const auto& output = fc_params.outputs[0];
@@ -260,10 +266,6 @@ bool FullyConnected_int3_dpas::Validate(const Params& params) const {
         DO_NOT_USE_THIS_KERNEL(params.layerID);
 
     if (input.GetDType() != Datatype::F16)
-        DO_NOT_USE_THIS_KERNEL(params.layerID);
-
-    // Fused ops and swiglu are not wired into the accumulator loop.
-    if (!fc_params.fused_ops.empty())
         DO_NOT_USE_THIS_KERNEL(params.layerID);
 
     if (input.GetFirstElementOffset() != 0)
@@ -359,11 +361,26 @@ JitConstants FullyConnected_int3_dpas::GetJitConstants(const fully_connected_par
     const size_t group_size = get_quantize_group_size(params);
     jit.AddConstant(MakeJitConstant("QUANTIZE_GROUP_SIZE", group_size));
     jit.AddConstant(MakeJitConstant("IFM_SIZE", get_input_bf_size(params).second));
-    jit.AddConstant(MakeJitConstant("GROUPED_WEIGHTS", get_expert_count(params) > 1 ? 1 : 0));
-    // The scale is addressed as a contiguous [G*N, groups] table, which is the
-    // grouped and the plain case alike (G == 1), rather than through the
-    // DECOMPRESSION_SCALE_* pitches that describe the unflattened tensor.
-    jit.AddConstant(MakeJitConstant("WEI_SCALE_GROUPS_K", get_scale_groups_k(params)));
+    const bool grouped = get_expert_count(params) > 1;
+    jit.AddConstant(MakeJitConstant("GROUPED_WEIGHTS", grouped ? 1 : 0));
+
+    // The scale is [N, groups] for a plain weight and [G, N, groups] for a grouped
+    // one, and is not necessarily dense in that order: the grouped scale of the
+    // Qwen3.6 experts arrives as byfx, i.e. [G][groups][N] in memory. So it is
+    // addressed through its own pitches, per (expert, channel, group).
+    const auto& scale = params.decompression_scale;
+    size_t scale_e_pitch = 0;
+    size_t scale_n_pitch = scale.Batch().pitch;
+    size_t scale_g_pitch = scale.Feature().pitch;
+    if (grouped) {
+        scale_e_pitch = scale.Batch().pitch;
+        scale_n_pitch = scale.Feature().pitch;
+        scale_g_pitch = (scale.Y().v == get_scale_groups_k(params)) ? scale.Y().pitch : scale.X().pitch;
+    }
+    jit.AddConstant(MakeJitConstant("WEI_SCALE_OFFSET", scale.GetFirstElementOffset()));
+    jit.AddConstant(MakeJitConstant("WEI_SCALE_E_PITCH", scale_e_pitch));
+    jit.AddConstant(MakeJitConstant("WEI_SCALE_N_PITCH", scale_n_pitch));
+    jit.AddConstant(MakeJitConstant("WEI_SCALE_G_PITCH", scale_g_pitch));
     jit.AddConstant(MakeJitConstant("WEI_SCALE_GROUP_SIZE", get_wei_scale_group_size(params)));
 
     const auto activation_dt = Datatype::F32;
@@ -396,6 +413,17 @@ JitConstants FullyConnected_int3_dpas::GetGemmJitConstants(const fully_connected
     jit.AddConstant(MakeJitConstant("TILE_M", cfg.tile_m));
     jit.AddConstant(MakeJitConstant("SG_M", cfg.sg_m));
     jit.AddConstant(MakeJitConstant("SG_K", cfg.sg_k));
+
+    // The store addresses output element (out_row, n), out_row being the row of
+    // the flattened, expert-major batch. A 3D bfyx output [G, M, N] splits it back
+    // into (expert, row) as b and f.
+    if (!params.fused_ops.empty()) {
+        std::vector<std::string> idx_order = { "out_row", "n", "0", "0" };
+        if (params.outputs[0].GetLayout() == DataLayout::bfyx)
+            idx_order = { "out_row / OUTPUT_FEATURE_NUM", "out_row % OUTPUT_FEATURE_NUM", "n", "0" };
+        FusedOpsConfiguration conf = { "", idx_order, "activated", Datatype::F32, 1 };
+        jit.Merge(MakeFusedOpsJitConstants(params, { conf }));
+    }
 
     return jit;
 }
@@ -485,7 +513,7 @@ KernelsData FullyConnected_int3_dpas::GetKernelsData(const Params& params) const
                          true,
                          !fc_params.bias.empty(),
                          inputs_count,
-                         0,
+                         GetFusedPrimitiveInputsCount(params),
                          1,
                          fc_params.is_shape_agnostic);
 

@@ -207,13 +207,13 @@ KERNEL(quantize_input)(
            as_int(U3_CHAR4(w0, w1, w2, 16)), as_int(U3_CHAR4(w0, w1, w2, 20)),      \
            as_int(U3_CHAR4(w0, w1, w2, 24)), as_int(U3_CHAR4(w0, w1, w2, 28)))
 
-// The scale is a contiguous [G*N, WEI_SCALE_GROUPS_K] table indexed by output
-// channel in the flattened weight space, so one expression covers the grouped and
-// the plain case alike (G == 1 for the latter). Going through the
-// DECOMPRESSION_SCALE_* pitches instead would describe the unflattened
-// [G, N, groups] tensor and address the wrong element for a grouped weight.
-#define WEI_SCALE(n, k)                                                             \
-    ((float)(decompression_scale[(n) * WEI_SCALE_GROUPS_K + (k) / WEI_SCALE_GROUP_SIZE]))
+// The scale of expert e, output channel n (within the expert) and input k. The
+// pitches come from the host and follow the scale's actual memory order, which for
+// a grouped weight is not necessarily [G, N, groups] (E_PITCH is 0 when plain).
+#define WEI_SCALE(e, n, k)                                                          \
+    ((float)(decompression_scale[WEI_SCALE_OFFSET + (e) * WEI_SCALE_E_PITCH +       \
+                                 (n) * WEI_SCALE_N_PITCH +                          \
+                                 ((k) / WEI_SCALE_GROUP_SIZE) * WEI_SCALE_G_PITCH]))
 
 #if DECOMPRESSION_ZP_TERM
 #   if DECOMPRESSION_ZP_SCALAR
@@ -247,6 +247,9 @@ KERNEL(fc)(
 #if BIAS_TERM
     , const __global BIAS_TYPE* biases
 #endif
+#if HAS_FUSED_OPS_DECLS
+    , FUSED_OPS_DECLS
+#endif
     , const __global char* quantized_input
     , const __global float* quan_var
 )
@@ -267,8 +270,8 @@ KERNEL(fc)(
     // flattened, expert-major activation and output tensors.
     const uint batch_size = ROWS_PER_EXPERT;
     const uint row_base   = expert * batch_size;
-    // Output channel in the flattened [G*N] weight space, for the scale and the
-    // zero point, both of which are indexed per output channel.
+    // Output channel in the flattened [G*N] weight space, for the zero point and
+    // the bias, both of which are indexed per output channel.
     const uint n_global   = expert * TILE_OUT_F_NUM + n;
 
     const __global uint* B = (const __global uint*)weights + (size_t)expert * B_UINTS_PER_EXPERT;
@@ -319,7 +322,7 @@ KERNEL(fc)(
 #endif
             }
 
-            const float bs = WEI_SCALE(n_global, g * GROUP_SIZE);
+            const float bs = WEI_SCALE(expert, n, g * GROUP_SIZE);
 #if DECOMPRESSION_ZP_TERM
             const float bzp = WEI_ZP(n_global, g * GROUP_SIZE);
 #endif
@@ -415,7 +418,7 @@ KERNEL(fc)(
             }
         }
 
-        const float bs = WEI_SCALE(n_global, g * GROUP_SIZE);
+        const float bs = WEI_SCALE(expert, n, g * GROUP_SIZE);
 #if DECOMPRESSION_ZP_TERM
         const float bzp = WEI_ZP(n_global, g * GROUP_SIZE);
 #endif
@@ -458,9 +461,15 @@ KERNEL(fc)(
 #if BIAS_TERM
             res += (float)biases[n_global];
 #endif
-            const uint output_offset =
-                n * TILE_OUT_F_PITCH + (row_base + row) * TILE_OUT_B_PITCH + OUTPUT_OFFSET;
-            output[output_offset] = TO_OUTPUT_TYPE(ACTIVATION_TYPED(res, ACTIVATION_PARAMS_TYPED));
+            const uint out_row = row_base + row;
+            const uint output_offset = n * TILE_OUT_F_PITCH + out_row * TILE_OUT_B_PITCH + OUTPUT_OFFSET;
+            const float activated = ACTIVATION_TYPED(res, ACTIVATION_PARAMS_TYPED);
+#if HAS_FUSED_OPS
+            FUSED_OPS;
+            output[output_offset] = FUSED_OPS_RESULT;
+#else
+            output[output_offset] = TO_OUTPUT_TYPE(activated);
+#endif
         }
     }
 }

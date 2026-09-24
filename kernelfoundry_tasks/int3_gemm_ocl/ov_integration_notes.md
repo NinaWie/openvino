@@ -83,7 +83,53 @@ compile-time scalar `WEI_ZP` in at unpack time (`v - WEI_ZP`). That is fine for 
 CMake globs sources at configure time, so re-run `cmake build` after adding files or the new
 `.cpp` is silently skipped and you get an undefined-vtable link error.
 
-## STATUS (2026-09-23, commit `b16bee9615`): the model RUNS. Read this first.
+## STATUS (2026-09-24): all 140 u3 FCs on `int3_dpas`, correct output. Read this first.
+
+Everything below this section predates it; where they disagree, this wins.
+
+27-token prompt, 8 tokens, GPU. Token IDs are the known-good
+`[248068, 198, 90700, 8340, 25, 271, 16, 13]` in every row that has them.
+
+| configuration | prefill (wall, 1st inference) | prefill (GPU, profiled) | decode |
+| --- | --- | --- | --- |
+| `OV_INT3_BASELINE=1` (all u3 on oneDNN `ocl:ref`) | 77.4 s | - | 3.0 s/tok |
+| **current** | **2.4-4.4 s** | **0.83 s** | **0.19-0.24 s/tok** |
+| int4 model, same build | 0.86 s | - | 0.04 s/tok |
+
+Selection: 351 u8 on oneDNN, **140 u3 on `fully_connected_gpu_int3_dpas__f16`** (all
+120 expert bmms, 10 `q_proj`, 10 `o_proj`), 0 on `bfyx_ref`.
+
+Three bugs were in the way, found with the synthetic `~/SYCL_work/test_u3_moe.py`
+(grouped bmm, bmm with fused silu*up, 2D FC + add, vs NumPy):
+
+1. **Wrong output shape for reordered grouped weights.** The OCL weights reorder crops
+   its output to 2D, so after it a grouped weight reaches shape inference as
+   `[G*N, K]` and `calc_output_layouts` produced `[G, M, G*N]`. That broke a
+   downstream Add's shape inference and caused the page fault. Fix: `fully_connected.cpp`
+   restores `[G, rows/G, K]` from the input batch when `weights_rank == 3`, and
+   `get_fc_output_layout` in `impls/ocl/fully_connected.cpp` now takes the
+   shape-inferred output for grouped weights instead of re-deriving N.
+2. **`bmm/MatMul` was rejected because of fused ops, not its shape.** It is the gate
+   projection (N=512, K=2048, same as `MatMul_1`, not down_proj as guessed above), with
+   SiLU and the `* up` Multiply fused in. The kernel now supports ACTIVATION and ELTWISE
+   fused ops at its store (index order as bf_tiled's for 3D bfyx). That also moved
+   `o_proj` off `bfyx_ref`.
+3. **Grouped scale addressed in the wrong order.** The expert scale arrives as
+   `byfx` `[G, N, groups]`, i.e. `[G][groups][N]` in memory, but `WEI_SCALE` assumed a
+   dense `[G*N, groups]`. Correct only when groups == 1, which is why K=128 tests passed
+   and K=2048 produced garbage tokens. `WEI_SCALE(e, n, k)` now goes through host-side
+   pitches (`WEI_SCALE_{OFFSET,E_PITCH,N_PITCH,G_PITCH}`).
+
+Where prefill GPU time goes now (825 ms): expert bmms 539 ms (~4.5 ms/node vs ~1.1 ms
+for the KernelFoundry kernel, so `get_dpas_config` tuning is the next lever), `Tile`
+164 ms (the model tiles activations to all 256 experts), eltwise Multiply 70 ms.
+
+`OV_INT3_BASELINE=1` is a TEMPORARY env switch (in `fully_connected_onednn.hpp`,
+`transformations_pipeline.cpp`, `fully_connected_kernel_int3_dpas.cpp`) that restores
+the all-oneDNN configuration for A/B runs. The `OV_SYNC_PROBE` probe in `network.cpp`
+is still compiled in. Both should go before this is upstreamed.
+
+## STATUS (2026-09-23, commit `b16bee9615`): the model RUNS.
 
 The `CL_OUT_OF_RESOURCES` crash is fixed and the branch no longer carries a performance
 regression. Two one-line-scope fixes, both narrowing over-broad predicates that

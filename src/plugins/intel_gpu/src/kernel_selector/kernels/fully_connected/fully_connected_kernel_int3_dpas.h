@@ -42,6 +42,12 @@ public:
     };
 
 protected:
+    // Applied per output element at the final store. SWIGLU is left out: it halves
+    // the output feature dimension, which the store indexing does not model.
+    std::vector<FusedOpType> GetSupportedFusedOps() const override {
+        return { FusedOpType::ACTIVATION,
+                 FusedOpType::ELTWISE };
+    }
     bool Validate(const Params& params) const override;
     JitConstants GetJitConstants(const fully_connected_params& params, const DispatchData& dispatchData) const override;
     void GetUpdateDispatchDataFunc(KernelData& kd) const override;

@@ -206,6 +206,17 @@ std::vector<layout> fully_connected_inst::calc_output_layouts(fully_connected_no
         weights_layout.get<ShapeType>()
     };
 
+    // A weights reorder flattens a grouped [G, N, K] weight to [G*N, K]. Batched
+    // matmul semantics put the group count in the input's batch dimension, so the
+    // expert dimension can be restored from it.
+    if (desc->weights_rank == 3 && desc->weights_transposed && input_shapes[0].size() == 3 &&
+        input_shapes[1].size() == 2 && input_shapes[0][0].is_static() && input_shapes[1][0].is_static()) {
+        const auto groups = input_shapes[0][0].get_length();
+        const auto rows = input_shapes[1][0].get_length();
+        if (groups > 1 && rows % groups == 0)
+            input_shapes[1] = ShapeType{groups, rows / groups, input_shapes[1][1]};
+    }
+
     std::vector<ShapeType> output_shapes = ov::op::v0::shape_infer(&matmul_op, input_shapes);
     bool has_swiglu = false;
     const auto& fused_prims = node.get_fused_primitives();
