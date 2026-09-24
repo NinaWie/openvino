@@ -1,6 +1,6 @@
 # u3 (int3) weights in the GPU plugin: the `fully_connected_gpu_int3_dpas` kernel
 
-Branch `nw/gpu/int3_ocl_gemm`. Target model: `Qwen3.6-35B-A3B-compressed-int3`
+Target model: `Qwen3.6-35B-A3B-compressed-int3`
 (140 u3 weight constants: 10 `q_proj`, 10 `o_proj`, 120 MoE expert matmuls over 256
 experts; the rest of the model is u8). Measured on Panther Lake (Xe3, XMX).
 
@@ -137,11 +137,15 @@ bypass, routed down, FC + add; M from 1 to 256) compare against NumPy.
 
 ### Known limits
 
-- **The MoE is dense in this model.** Every token goes through all 256 experts. Decode
+- **The MoE runs dense for u3.** The IR computes every expert and masks with the routing
+  weights. The plugin's MoE fusion (`ConvertTiledMoeBlockToGatherMatmuls` ->
+  `MOE3GemmCompressed`, routed top-k) accepts only u4/i4/u8/i8 weights, so u3 models stay
+  dense on any kernel, oneDNN included. Every token goes through all 256 experts. Decode
   therefore reads every expert's weights (bandwidth-bound, hence 0.17 s/tok vs int4's
   0.04), and activation memory grows as 256 x T x 2048. Prompts of 256+ tokens run out of
-  memory on a 32 GB iGPU machine. Routed (top-k) expert execution or a chunked prefill is
-  the fix for both, and is a structural change.
+  memory on a 32 GB iGPU machine. The fix for both is to enable u3 in that fusion, which
+  needs u3 expert GEMMs inside `MOE3GemmCompressed`. `BypassExpertTile` and
+  `MoveExpertRoutingScale` only speed up the dense fallback.
 - Grouped zero points are not supported; only a scalar zp.
 
 ### Temporary code to remove before upstreaming
