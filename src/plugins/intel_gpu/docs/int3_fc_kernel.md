@@ -152,4 +152,3 @@ bypass, routed down, FC + add; M from 1 to 256) compare against NumPy.
 
 - `OV_INT3_BASELINE` env switch (`fully_connected_onednn.hpp`, `transformations_pipeline.cpp`,
   `fully_connected_kernel_int3_dpas.cpp`) restores the all-oneDNN path for A/B runs.
-- `OV_SYNC_PROBE` in `network.cpp` (sync after each primitive to find a faulting one).
