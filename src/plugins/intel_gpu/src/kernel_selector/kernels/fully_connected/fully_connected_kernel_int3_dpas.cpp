@@ -123,12 +123,19 @@ size_t get_expert_count(const fully_connected_params& params) {
     return weights_ofm / ofm;
 }
 
+// A grouped weight against activations [1, M, K] shared by every expert, as left
+// by BypassExpertTile, rather than one [M, K] slice per expert.
+bool is_broadcast_input(const fully_connected_params& params) {
+    return get_expert_count(params) > 1 && params.outputs[0].GetLayout() == DataLayout::bfyx &&
+           params.inputs[0].Batch().v == 1;
+}
+
 // Rows belonging to one expert. get_input_bf_size flattens the batch across
-// experts, so it counts every expert's rows.
+// experts, so it counts every expert's rows unless the input is broadcast.
 size_t get_rows_per_expert(const fully_connected_params& params) {
     const size_t batch = get_input_bf_size(params).first;
     const size_t experts = get_expert_count(params);
-    if (experts <= 1)
+    if (experts <= 1 || is_broadcast_input(params))
         return batch;
     return batch / experts;
 }
@@ -143,21 +150,29 @@ gemm_config get_dpas_config(const fully_connected_params& params) {
     if (group_size == 0)
         return cfg;
 
-    const size_t chunks_per_group = group_size / k_chunk;
-    const size_t groups_k = get_input_bf_size(params).second / group_size;
+    // A shape-agnostic kernel is compiled before the row count is known, and its
+    // runtime dispatch recomputes this config, so it must not depend on M there.
+    // 32 x 1 is the best or near-best choice from 16 to 64 rows per expert on the
+    // Qwen3.6 MoE shapes; the rows past M in a tile are padding the matrix engine
+    // still pays for, and SLM sharing (sg_m > 1) only pays off from ~128 rows.
+    if (params.is_shape_agnostic)
+        return cfg;
 
-    // The sg_m subgroups split one staging iteration's granules between them, so
-    // the iteration has to cover a whole number of quantization groups and split
-    // evenly. Prefer the widest sharing that satisfies both.
-    for (size_t candidate : {size_t{4}, size_t{2}}) {
-        const size_t groups_per_iter = (candidate > chunks_per_group) ? candidate / chunks_per_group : 1;
-        if (candidate > chunks_per_group && (candidate % chunks_per_group) != 0)
-            continue;
+    const size_t rows = get_rows_per_expert(params);
+    if (rows <= 8) {
+        cfg.tile_m = 8;
+    } else if (rows <= 16) {
+        cfg.tile_m = 16;
+    } else if (rows > 64) {
+        // The sg_m subgroups split one staging iteration's granules between them,
+        // so the iteration has to cover whole quantization groups and split evenly.
+        const size_t chunks_per_group = group_size / k_chunk;
+        const size_t groups_k = get_input_bf_size(params).second / group_size;
+        const size_t sg_m = 2;
+        const size_t groups_per_iter = (sg_m > chunks_per_group) ? sg_m / chunks_per_group : 1;
         const size_t chunks_per_iter = groups_per_iter * chunks_per_group;
-        if ((chunks_per_iter % candidate) != 0 || (groups_k % groups_per_iter) != 0)
-            continue;
-        cfg.sg_m = candidate;
-        break;
+        if ((chunks_per_iter % sg_m) == 0 && (groups_k % groups_per_iter) == 0)
+            cfg.sg_m = sg_m;
     }
 
     return cfg;
@@ -182,6 +197,23 @@ gemm_config get_scalar_config(const fully_connected_params& params) {
     }
 
     return cfg;
+}
+
+// One subgroup per quantization group, several subgroups per workgroup where the
+// group count allows it.
+CommonDispatchData get_quantize_dispatch(size_t num_groups) {
+    CommonDispatchData dispatchData;
+    num_groups = std::max(num_groups, size_t{1});
+    size_t sgs_per_wg = 1;
+    for (size_t candidate : {size_t{16}, size_t{8}, size_t{4}, size_t{2}}) {
+        if ((num_groups % candidate) == 0) {
+            sgs_per_wg = candidate;
+            break;
+        }
+    }
+    dispatchData.gws = {num_groups * simd, 1, 1};
+    dispatchData.lws = {sgs_per_wg * simd, 1, 1};
+    return dispatchData;
 }
 
 // The M dimension is tiled within one expert, never across two: a row tile shares
@@ -305,7 +337,9 @@ bool FullyConnected_int3_dpas::Validate(const Params& params) const {
         // M is dynamic at build time, so only cross-check the flattened batch
         // against the expert count when it is actually known.
         const size_t batch = get_input_bf_size(fc_params).first;
-        if (batch != 0 && (batch % experts) != 0)
+        if (!is_broadcast_input(fc_params) && batch != 0 && (batch % experts) != 0)
+            DO_NOT_USE_THIS_KERNEL(params.layerID);
+        if (!is_broadcast_input(fc_params) && input.Batch().v != experts)
             DO_NOT_USE_THIS_KERNEL(params.layerID);
         // A per-group zero point is indexed through the DECOMPRESSION_ZP_* tensor
         // macros, which describe the unflattened [G, N, groups] tensor and so do
@@ -363,6 +397,7 @@ JitConstants FullyConnected_int3_dpas::GetJitConstants(const fully_connected_par
     jit.AddConstant(MakeJitConstant("IFM_SIZE", get_input_bf_size(params).second));
     const bool grouped = get_expert_count(params) > 1;
     jit.AddConstant(MakeJitConstant("GROUPED_WEIGHTS", grouped ? 1 : 0));
+    jit.AddConstant(MakeJitConstant("BROADCAST_INPUT", is_broadcast_input(params) ? 1 : 0));
 
     // The scale is [N, groups] for a plain weight and [G, N, groups] for a grouped
     // one, and is not necessarily dense in that order: the grouped scale of the
@@ -454,9 +489,7 @@ KernelsData FullyConnected_int3_dpas::GetKernelsData(const Params& params) const
     // Kernel 0: activation quantizer.
     {
         auto& quan_kernel = kd.kernels[0];
-        CommonDispatchData quan_dispatch;
-        quan_dispatch.gws = {std::max(input_size / group_size, size_t{1}), 1, 1};
-        quan_dispatch.lws = {1, 1, 1};
+        const auto quan_dispatch = get_quantize_dispatch(input_size / group_size);
 
         auto entry_point = GetEntryPoint(kernelName, fc_params.layerID, params, 0);
         auto cldnn_jit = GetJitConstants(new_params, DispatchData());
@@ -544,8 +577,9 @@ void FullyConnected_int3_dpas::GetUpdateDispatchDataFunc(KernelData& kd) const {
 
         const bool skip = KernelData::SkipKernelExecution(prim_params);
 
-        kd.kernels[0].params.workGroups.global = {std::max(input_size / group_size, size_t{1}), 1, 1};
-        kd.kernels[0].params.workGroups.local = {1, 1, 1};
+        const auto quan_dispatch = get_quantize_dispatch(input_size / group_size);
+        kd.kernels[0].params.workGroups.global = quan_dispatch.gws;
+        kd.kernels[0].params.workGroups.local = quan_dispatch.lws;
         kd.kernels[0].skip_execution = skip;
 
         const size_t experts = get_expert_count(prim_params);

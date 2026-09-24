@@ -83,9 +83,53 @@ compile-time scalar `WEI_ZP` in at unpack time (`v - WEI_ZP`). That is fine for 
 CMake globs sources at configure time, so re-run `cmake build` after adding files or the new
 `.cpp` is silently skipped and you get an undefined-vtable link error.
 
-## STATUS (2026-09-24): all 140 u3 FCs on `int3_dpas`, correct output. Read this first.
+## SPEED (2026-09-24, uncommitted): expert bmms at KernelFoundry speed. Read this first.
 
 Everything below this section predates it; where they disagree, this wins.
+
+27-token prompt, correct tokens: prefill GPU **825 -> 177 ms**, warm prefill 0.53 s,
+decode 0.19 s/tok. Expert bmms ~1.05 ms/node (KernelFoundry: ~1.1 ms). What is left
+of the 177 ms: int3 FCs 129 ms, u8 oneDNN FCs 23.5 ms, expert ReduceSum 10.8 ms.
+`bench_moe.py` at M=27: gate_up 4.60 -> 1.74 ms, down 3.66 -> 1.55 ms.
+
+1. **Dynamic quantizer rewritten** (kernel 0 of the int3 FC): one 16-lane subgroup per
+   quantization group with subgroup reductions, dispatch from
+   `get_quantize_dispatch`. It was most of the old 539 ms of "FC" time.
+2. **`get_dpas_config` picks by rows** (static kernels only; `__sa` keeps 32x1):
+   rows <= 8 -> tile_m 8, <= 16 -> tile_m 16, > 64 -> sg_m 2. From a sweep: 32x1 wins
+   for 16-64 rows, 64-row tiles lose, SLM sharing only pays at ~128 rows.
+3. **`Tile` removed** (`plugin/transformations/dense_moe_experts.cpp`,
+   `BypassExpertTile`): `Reshape(Tile(x, [G,1]))` feeding u3 grouped MatMuls becomes
+   `Reshape(x, [1,-1,K])`, and the kernel reads the same activation rows for every
+   expert (`BROADCAST_INPUT`: expert dim of the input is 1). Validate accepts
+   `input batch == 1` for grouped weights.
+4. **Routing scale fused into the down bmm** (`MoveExpertRoutingScale`):
+   `Multiply(Reshape(bmm), scale)` becomes `Reshape(Multiply(bmm, Reshape(scale,
+   [G,-1,1])))`, which fuses as an ELTWISE op into the int3 kernel.
+5. Grouped output shape (bug 1 below) is now restored from the **scale's** expert dim,
+   since with the broadcast input the input batch is 1.
+
+Both passes are registered before `ConvertMatMulToFullyConnected` and only when
+`supports_immad` and not `OV_INT3_BASELINE`. They check for u3 weights, so non-u3
+models are untouched. Tests: `test_u3_moe.py` (now also `tile_gate`, `routed_down`,
+M up to 256), `test_u3_fc.py`: all pass.
+
+### Long prompts run out of memory (open)
+
+The dense MoE computes every token through all 256 experts, so intermediates grow as
+256 x T x 2048. 1030 tokens: "Exceeded max size of memory allocation" (32.6 GB occupied).
+256 tokens: exhausted host RAM (iGPU shares it) and the OOM killer hit the process.
+Note: after ANY GPU run `free` shows ~15 GB "used" with no owner. That is the TTM page
+pool caching freed GPU pages (`sudo cat /sys/kernel/debug/ttm/page_pool`, limit half of
+RAM), not a leak; `~/SYCL_work/ttm_drain.sh` returns it. **Do not run prompts
+much over ~100 tokens on this machine** until this is fixed. Weights are not duplicated
+(checked: one G=256 layer holds 101 MB of u3 weights, 116 MB device total). The real
+fixes are chunking the prefill, or routed (top-k) MoE execution, which is also the only
+way decode stops being bound by reading all 256 experts' weights.
+
+## STATUS (2026-09-24): all 140 u3 FCs on `int3_dpas`, correct output.
+
+The state before the SPEED work above.
 
 27-token prompt, 8 tokens, GPU. Token IDs are the known-good
 `[248068, 198, 90700, 8340, 25, 271, 16, 13]` in every row that has them.

@@ -67,7 +67,9 @@ gemm_config get_dpas_config(const fully_connected_params& params);
 gemm_config get_scalar_config(const fully_connected_params& params);
 size_t get_quantized_input_size(const fully_connected_params& params);
 size_t get_expert_count(const fully_connected_params& params);
+bool is_broadcast_input(const fully_connected_params& params);
 size_t get_rows_per_expert(const fully_connected_params& params);
+CommonDispatchData get_quantize_dispatch(size_t num_groups);
 CommonDispatchData get_gemm_dispatch(const fully_connected_params& params,
                                      const gemm_config& cfg,
                                      size_t rows_per_expert,

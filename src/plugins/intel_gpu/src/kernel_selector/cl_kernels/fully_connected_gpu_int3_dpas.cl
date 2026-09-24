@@ -71,53 +71,81 @@
 
 #if FC_KERNEL_DYNAMIC_QUANTIZE
 
-// One work item quantizes one QUANTIZE_GROUP_SIZE-long run of the activation
-// tensor, in the tensor's own element order, so the quantized buffer mirrors the
-// input buffer exactly.
+// One 16-lane subgroup quantizes one QUANTIZE_GROUP_SIZE-long run of the
+// activation tensor, in the tensor's own element order, so the quantized buffer
+// mirrors the input buffer exactly. Each lane owns QUANT_PER_LANE consecutive
+// elements, so the subgroup's loads and stores are each one contiguous run.
+#define QUANT_SIMD     16
+#define QUANT_PER_LANE (QUANTIZE_GROUP_SIZE / QUANT_SIMD)
+
+#if QUANT_PER_LANE == 8
+#   define QUANT_IN_VEC        MAKE_VECTOR_TYPE(INPUT0_TYPE, 8)
+#   define QUANT_CHAR_VEC      char8
+#   define QUANT_VLOAD(p)      vload8(0, p)
+#   define QUANT_VSTORE(v, p)  vstore8(v, 0, p)
+#   define QUANT_CONVERT_F(v)  convert_float8(v)
+#   define QUANT_CONVERT_C(v)  convert_char8_sat_rte(v)
+#elif QUANT_PER_LANE == 4
+#   define QUANT_IN_VEC        MAKE_VECTOR_TYPE(INPUT0_TYPE, 4)
+#   define QUANT_CHAR_VEC      char4
+#   define QUANT_VLOAD(p)      vload4(0, p)
+#   define QUANT_VSTORE(v, p)  vstore4(v, 0, p)
+#   define QUANT_CONVERT_F(v)  convert_float4(v)
+#   define QUANT_CONVERT_C(v)  convert_char4_sat_rte(v)
+#elif QUANT_PER_LANE == 2
+#   define QUANT_IN_VEC        MAKE_VECTOR_TYPE(INPUT0_TYPE, 2)
+#   define QUANT_CHAR_VEC      char2
+#   define QUANT_VLOAD(p)      vload2(0, p)
+#   define QUANT_VSTORE(v, p)  vstore2(v, 0, p)
+#   define QUANT_CONVERT_F(v)  convert_float2(v)
+#   define QUANT_CONVERT_C(v)  convert_char2_sat_rte(v)
+#else
+#   error "fully_connected_gpu_int3_dpas.cl - unsupported QUANTIZE_GROUP_SIZE"
+#endif
+
+REQD_SUB_GROUP_SIZE(QUANT_SIMD)
 KERNEL(quantize_input)(
     const __global INPUT0_TYPE* input,
     __global char* quantized_input,
     __global float* quan_var)
 {
-    const uint offset = (uint)get_global_id(0);
-    const uint input_offset = offset * QUANTIZE_GROUP_SIZE;
-    const uint quantize_block = QUANTIZE_GROUP_SIZE / 4;
+    const uint group = (uint)get_global_id(0) / QUANT_SIMD;
+    const uint lane = get_sub_group_local_id();
+    const uint offset = group * QUANTIZE_GROUP_SIZE + lane * QUANT_PER_LANE;
 
-    MAKE_VECTOR_TYPE(INPUT0_TYPE, 4) input_0;
-    INPUT0_TYPE max_per_quad[quantize_block];
+    const QUANT_IN_VEC v = QUANT_VLOAD(&input[offset]);
 
-    unroll_for (uint i = 0; i < quantize_block; ++i) {
-        input_0 = vload4(0, &input[input_offset + i * 4]);
-        max_per_quad[i] = fmax(fmax(fabs(input_0[0]), fabs(input_0[1])),
-                               fmax(fabs(input_0[2]), fabs(input_0[3])));
-    }
-
-    INPUT0_TYPE max_value = 0.001h;
-    for (uint i = 0; i < quantize_block; i += 8) {
-        INPUT0_TYPE temp = fmax(fmax(fmax(max_per_quad[i + 0], max_per_quad[i + 1]),
-                                     fmax(max_per_quad[i + 2], max_per_quad[i + 3])),
-                                fmax(fmax(max_per_quad[i + 4], max_per_quad[i + 5]),
-                                     fmax(max_per_quad[i + 6], max_per_quad[i + 7])));
-        max_value = fmax(max_value, temp);
-    }
+    INPUT0_TYPE lane_max = 0.001h;
+    unroll_for (uint i = 0; i < QUANT_PER_LANE; ++i)
+        lane_max = fmax(lane_max, fabs(v[i]));
+    const INPUT0_TYPE max_value = sub_group_reduce_max(lane_max);
 
     const float quan_scale = (float)max_value / 127.f;
-    int quantized_sum = 0;
+    const QUANT_CHAR_VEC q = QUANT_CONVERT_C(QUANT_CONVERT_F(v) / quan_scale);
+    QUANT_VSTORE(q, &quantized_input[offset]);
 
-    for (uint i = 0; i < quantize_block; ++i) {
-        input_0 = vload4(0, &input[input_offset + i * 4]);
-        const float4 buff = convert_float4(input_0) / quan_scale;
-        const char4 quantized_value = convert_char4_sat_rte(buff);
-        quantized_sum += quantized_value[0] + quantized_value[1] + quantized_value[2] + quantized_value[3];
-        vstore4(quantized_value, 0, &quantized_input[input_offset + i * 4]);
-    }
+    int lane_sum = 0;
+    unroll_for (uint i = 0; i < QUANT_PER_LANE; ++i)
+        lane_sum += q[i];
+    const int quantized_sum = sub_group_reduce_add(lane_sum);
 
     // The activation sum is kept in f32: it reaches a few thousand, where f16
     // spacing is already 1.0, and it is subtracted from a same-magnitude integer
     // accumulator, so rounding it would show up directly in the result.
-    quan_var[offset * 2 + 0] = quan_scale;
-    quan_var[offset * 2 + 1] = (float)quantized_sum;
+    if (lane == 0) {
+        quan_var[group * 2 + 0] = quan_scale;
+        quan_var[group * 2 + 1] = (float)quantized_sum;
+    }
 }
+
+#undef QUANT_SIMD
+#undef QUANT_PER_LANE
+#undef QUANT_IN_VEC
+#undef QUANT_CHAR_VEC
+#undef QUANT_VLOAD
+#undef QUANT_VSTORE
+#undef QUANT_CONVERT_F
+#undef QUANT_CONVERT_C
 
 #else  // !FC_KERNEL_DYNAMIC_QUANTIZE
 
@@ -270,6 +298,12 @@ KERNEL(fc)(
     // flattened, expert-major activation and output tensors.
     const uint batch_size = ROWS_PER_EXPERT;
     const uint row_base   = expert * batch_size;
+    // A broadcast input is one [M, K] slice read by every expert.
+#if BROADCAST_INPUT
+    const uint a_row_base = 0;
+#else
+    const uint a_row_base = row_base;
+#endif
     // Output channel in the flattened [G*N] weight space, for the zero point and
     // the bias, both of which are indexed per output channel.
     const uint n_global   = expert * TILE_OUT_F_NUM + n;
@@ -337,7 +371,7 @@ KERNEL(fc)(
                 float asum[8];
 #endif
                 unroll_for (uint t = 0; t < 8; ++t) {
-                    const uint row = row_base + min(m0 + mb * 8 + t, batch_size - 1);
+                    const uint row = a_row_base + min(m0 + mb * 8 + t, batch_size - 1);
                     const __global ushort* ap = (const __global ushort*)(
                         quantized_input + row * TILE_IN_B_PITCH + g * GROUP_SIZE);
 #if CHUNKS_PER_GROUP == 4
@@ -402,7 +436,7 @@ KERNEL(fc)(
             const char4 v7 = U3_CHAR4(w0, w1, w2, 28);
 
             unroll_for (uint t = 0; t < TILE_M; ++t) {
-                const uint row = row_base + min(m0 + t, batch_size - 1);
+                const uint row = a_row_base + min(m0 + t, batch_size - 1);
                 const __global uint* ap = (const __global uint*)quantized_input +
                                           row * A_UINTS_PER_ROW + chunk * A_UINTS_PER_CHUNK;
                 int a = acc[t];
@@ -423,7 +457,7 @@ KERNEL(fc)(
         const float bzp = WEI_ZP(n_global, g * GROUP_SIZE);
 #endif
         unroll_for (uint t = 0; t < TILE_M; ++t) {
-            const uint row = row_base + min(m0 + t, batch_size - 1);
+            const uint row = a_row_base + min(m0 + t, batch_size - 1);
             const uint qv = (row * var_pitch + g) * 2;
             float part = (float)acc[t];
 #if DECOMPRESSION_ZP_TERM
